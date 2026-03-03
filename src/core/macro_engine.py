@@ -100,64 +100,74 @@ class MacroEngine:
         containing ``'success'`` (bool) and ``'errors'`` list.
         """
         result: Dict[str, Any] = {"success": True, "errors": []}
-        steps = macro.get("steps", [])
-        total = len(steps)
+        
+        try:
+            steps = macro.get("steps", [])
+            total = len(steps)
 
-        for idx, step in enumerate(steps, start=1):
-            if stop_event.is_set():
-                result["success"] = False
-                result["errors"].append("stopped")
-                break
+            for idx, step in enumerate(steps, start=1):
+                if stop_event.is_set():
+                    result["success"] = False
+                    result["errors"].append("stopped")
+                    break
 
-            action, params = next(iter(step.items()))
+                action, params = next(iter(step.items()))
 
-            # execute step
-            try:
-                if action == "wait":
-                    # ensure we have an integer millisecond value
+                # execute step
+                try:
+                    if action == "wait":
+                        # ensure we have an integer millisecond value
+                        try:
+                            ms = int(float(params))
+                        except Exception:
+                            raise ValueError(f"invalid wait parameter '{params}'")
+                        if self.delay_jitter_ms:
+                            ms += random.randint(-self.delay_jitter_ms, self.delay_jitter_ms)
+                            ms = max(0, ms)
+                        time.sleep(ms / 1000.0)
+                    elif action == "tap":
+                        x, y = int(params[0]), int(params[1])
+                        if self.pixel_jitter:
+                            x += random.randint(-self.pixel_jitter, self.pixel_jitter)
+                            y += random.randint(-self.pixel_jitter, self.pixel_jitter)
+                        adb.shell(serial, f"input tap {x} {y}")
+                    elif action == "swipe":
+                        x1, y1, x2, y2, dur = map(int, params)
+                        if self.pixel_jitter:
+                            x1 += random.randint(-self.pixel_jitter, self.pixel_jitter)
+                            y1 += random.randint(-self.pixel_jitter, self.pixel_jitter)
+                            x2 += random.randint(-self.pixel_jitter, self.pixel_jitter)
+                            y2 += random.randint(-self.pixel_jitter, self.pixel_jitter)
+                        adb.shell(serial, f"input swipe {x1} {y1} {x2} {y2} {dur}")
+                    elif action == "text":
+                        text = str(params)
+                        # escape spaces for shell
+                        text = text.replace(" ", "%s")
+                        adb.shell(serial, f"input text {text}")
+                    elif action == "keyevent":
+                        adb.shell(serial, f"input keyevent {params}")
+                except Exception as exc:  # pragma: no cover - defensive
+                    msg = f"error performing {action}: {exc}"
+                    self._log(msg)
+                    result["success"] = False
+                    result["errors"].append(msg)
+
+                # inter-step delay jitter
+                if self.delay_jitter_ms and action != "wait":
+                    extra = random.randint(0, self.delay_jitter_ms)
+                    time.sleep(extra / 1000.0)
+
+                # emit progress if requested
+                if progress_fn and instance_id is not None and total:
                     try:
-                        ms = int(float(params))
-                    except Exception:
-                        raise ValueError(f"invalid wait parameter '{params}'")
-                    if self.delay_jitter_ms:
-                        ms += random.randint(-self.delay_jitter_ms, self.delay_jitter_ms)
-                        ms = max(0, ms)
-                    time.sleep(ms / 1000.0)
-                elif action == "tap":
-                    x, y = int(params[0]), int(params[1])
-                    if self.pixel_jitter:
-                        x += random.randint(-self.pixel_jitter, self.pixel_jitter)
-                        y += random.randint(-self.pixel_jitter, self.pixel_jitter)
-                    adb.shell(serial, f"input tap {x} {y}")
-                elif action == "swipe":
-                    x1, y1, x2, y2, dur = map(int, params)
-                    if self.pixel_jitter:
-                        x1 += random.randint(-self.pixel_jitter, self.pixel_jitter)
-                        y1 += random.randint(-self.pixel_jitter, self.pixel_jitter)
-                        x2 += random.randint(-self.pixel_jitter, self.pixel_jitter)
-                        y2 += random.randint(-self.pixel_jitter, self.pixel_jitter)
-                    adb.shell(serial, f"input swipe {x1} {y1} {x2} {y2} {dur}")
-                elif action == "text":
-                    text = str(params)
-                    # escape spaces for shell
-                    text = text.replace(" ", "%s")
-                    adb.shell(serial, f"input text {text}")
-                elif action == "keyevent":
-                    adb.shell(serial, f"input keyevent {params}")
-            except Exception as exc:  # pragma: no cover - defensive
-                msg = f"error performing {action}: {exc}"
-                self._log(msg)
-                result["success"] = False
-                result["errors"].append(msg)
-
-            # inter-step delay jitter
-            if self.delay_jitter_ms and action != "wait":
-                extra = random.randint(0, self.delay_jitter_ms)
-                time.sleep(extra / 1000.0)
-
-            # emit progress if requested
-            if progress_fn and instance_id is not None and total:
-                pct = int(idx * 100 / total)
-                progress_fn(instance_id, pct)
+                        pct = int(idx * 100 / total)
+                        progress_fn(instance_id, pct)
+                    except Exception as exc:  # pragma: no cover - defensive
+                        self._log(f"error emitting progress: {exc}")
+        except Exception as exc:  # pragma: no cover - catch-all for catastrophic failures
+            msg = f"macro execution failed: {type(exc).__name__}: {exc}"
+            self._log(msg)
+            result["success"] = False
+            result["errors"].append(msg)
 
         return result

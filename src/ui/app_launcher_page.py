@@ -39,9 +39,11 @@ class AppLauncherPage(QWidget):
         self.log_fn = log_fn
         self.get_state_fn = get_state_fn
         self.get_adb_manager_fn = get_adb_manager_fn
+        self._is_closing = False
 
         self.task_runner = TaskRunner()
         self.task_runner.on_log.connect(self.log)
+        self.task_runner.on_error.connect(self._on_task_error)
         self.task_runner.on_done.connect(self._on_task_done)
 
         self._build_ui()
@@ -91,6 +93,15 @@ class AppLauncherPage(QWidget):
         if callable(self.log_fn):
             self.log_fn(msg)
 
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._is_closing = True
+        super().closeEvent(event)
+
+    def _on_task_error(self, message: str) -> None:
+        if self._is_closing:
+            return
+        self.log(f"Launch task error: {message}")
+
     def _on_profile_changed(self) -> None:
         """Update UI when profile selection changes."""
         data = self.profile_combo.currentData()
@@ -100,6 +111,8 @@ class AppLauncherPage(QWidget):
 
     def launch_on_selected(self) -> None:
         """Launch the selected profile on all selected instances."""
+        if self._is_closing:
+            return
         state = self.get_state_fn()
         selected = state.get_selected_instances()
         if not selected:
@@ -134,24 +147,29 @@ class AppLauncherPage(QWidget):
         progress_fn=None,
     ) -> Dict[str, bool]:
         """Background task to launch app on all selected instances."""
-        state = self.get_state_fn()
-        adb = self.get_adb_manager_fn()
         results: Dict[str, bool] = {}
+        try:
+            state = self.get_state_fn()
+            adb = self.get_adb_manager_fn()
 
-        for inst in state.get_selected_instances():
-            if not inst.adb_serial:
-                log_fn and log_fn(f"Instance {inst.name} has no ADB serial, skipping.")
-                results[inst.name] = False
-                continue
+            for inst in state.get_selected_instances():
+                if not inst.adb_serial:
+                    log_fn and log_fn(f"Instance {inst.name} has no ADB serial, skipping.")
+                    results[inst.name] = False
+                    continue
 
-            log_fn and log_fn(f"Launching {package} on {inst.name}...")
-            ok = adb.launch_app(inst.adb_serial, package, activity)
-            results[inst.name] = ok
+                log_fn and log_fn(f"Launching {package} on {inst.name}...")
+                ok = adb.launch_app(inst.adb_serial, package, activity)
+                results[inst.name] = ok
+        except Exception as exc:  # pragma: no cover - defensive
+            log_fn and log_fn(f"App launch worker failed: {exc}")
 
         return results
 
     def _on_task_done(self, result: Any) -> None:
         """Update results list when background task completes."""
+        if self._is_closing:
+            return
         if isinstance(result, dict):
             for instance_name, success in result.items():
                 status = "✓ Success" if success else "✗ Failed"

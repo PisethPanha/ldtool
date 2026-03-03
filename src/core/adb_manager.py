@@ -101,25 +101,46 @@ class ADBManager:
 
         self._log(f"timeout: no new device appeared within {timeout_s}s")
         return None
-    def shell(self, serial: str, cmd: str) -> str:
-        """Execute a shell command on the device.
+    def shell(self, serial: str, cmd: str, max_retries: int = 3) -> str:
+        """Execute a shell command on the device with retry logic.
 
         Returns the command output as a string, or an empty string on error.
-        Logs a clear error message if the device is not connected.
+        Attempts to re-detect the device if it temporarily disconnects.
+        
+        Args:
+            serial: device serial
+            cmd: shell command to execute
+            max_retries: maximum number of retry attempts (default 3)
         """
-
-        try:
-            # Ensure device exists in the list before trying to get it
-            devices = self.list_devices()
-            if serial not in devices:
-                err_msg = f"device '{serial}' not found; available: {devices}"
-                self._log(f"shell error: {err_msg}")
-                raise RuntimeError(err_msg)
-            dev = self._adb.device(serial=serial)
-            return dev.shell(cmd, timeout=10)
-        except Exception as exc:  # pragma: no cover - defensive
-            self._log(f"shell error on {serial}: {exc}")
-            return ""
+        retry_count = 0
+        while retry_count < max_retries:
+            try:
+                # Check if device exists
+                devices = self.list_devices()
+                if serial not in devices:
+                    if retry_count < max_retries - 1:
+                        self._log(f"device '{serial}' not found, retrying... (attempt {retry_count + 1}/{max_retries})")
+                        time.sleep(0.5)
+                        retry_count += 1
+                        continue
+                    else:
+                        self._log(f"shell error: device '{serial}' not found after {max_retries} attempts")
+                        return ""
+                
+                # Device found, execute command
+                dev = self._adb.device(serial=serial)
+                result = dev.shell(cmd, timeout=10)
+                return result
+            except Exception as exc:
+                if retry_count < max_retries - 1:
+                    self._log(f"shell error on {serial}: {exc}, retrying... (attempt {retry_count + 1}/{max_retries})")
+                    time.sleep(0.5)
+                    retry_count += 1
+                else:
+                    self._log(f"shell error on {serial} after {max_retries} attempts: {exc}")
+                    return ""
+        
+        return ""
 
     def is_device_ready(self, serial: str) -> bool:
         # check property sys.boot_completed

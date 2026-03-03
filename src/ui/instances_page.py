@@ -13,11 +13,15 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QSpinBox,
     QLabel,
+    QComboBox,
+    QRadioButton,
+    QButtonGroup,
 )
 
 from src.core.ldplayer_controller import LDPlayerController
 from src.core.adb_manager import ADBManager
 from src.core.task_runner import TaskRunner
+from src.core.window_manager import WindowManager
 
 
 class InstancesPage(QWidget):
@@ -90,6 +94,68 @@ class InstancesPage(QWidget):
         # single connection for itemChanged; handler will filter by column
         self.table.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self.table)
+
+        # window management section
+        win_label = QLabel("<b>Window Management</b>")
+        layout.addWidget(win_label)
+
+        # monitor and layout controls
+        win_ctrl_row = QHBoxLayout()
+        win_ctrl_row.addWidget(QLabel("Monitor:"))
+        self.monitor_combo = QComboBox()
+        self._populate_monitor_dropdown()
+        win_ctrl_row.addWidget(self.monitor_combo)
+
+        win_ctrl_row.addWidget(QLabel("Layout:"))
+        self.layout_auto_radio = QRadioButton("Auto")
+        self.layout_cols_radio = QRadioButton("Fixed Columns")
+        self.layout_rows_radio = QRadioButton("Fixed Rows")
+        self.layout_auto_radio.setChecked(True)
+        layout_group = QButtonGroup(self)
+        layout_group.addButton(self.layout_auto_radio)
+        layout_group.addButton(self.layout_cols_radio)
+        layout_group.addButton(self.layout_rows_radio)
+        self.layout_auto_radio.toggled.connect(self._on_layout_mode_changed)
+        self.layout_cols_radio.toggled.connect(self._on_layout_mode_changed)
+        self.layout_rows_radio.toggled.connect(self._on_layout_mode_changed)
+        win_ctrl_row.addWidget(self.layout_auto_radio)
+        win_ctrl_row.addWidget(self.layout_cols_radio)
+        win_ctrl_row.addWidget(self.layout_rows_radio)
+
+        win_ctrl_row.addWidget(QLabel("Cols:"))
+        self.cols_spin = QSpinBox()
+        self.cols_spin.setRange(1, 10)
+        self.cols_spin.setValue(2)
+        self.cols_spin.setEnabled(False)
+        win_ctrl_row.addWidget(self.cols_spin)
+
+        win_ctrl_row.addWidget(QLabel("Rows:"))
+        self.rows_spin = QSpinBox()
+        self.rows_spin.setRange(1, 10)
+        self.rows_spin.setValue(2)
+        self.rows_spin.setEnabled(False)
+        win_ctrl_row.addWidget(self.rows_spin)
+
+        win_ctrl_row.addWidget(QLabel("Padding (px):"))
+        self.padding_spin = QSpinBox()
+        self.padding_spin.setRange(0, 100)
+        self.padding_spin.setValue(10)
+        win_ctrl_row.addWidget(self.padding_spin)
+
+        layout.addLayout(win_ctrl_row)
+
+        # window management buttons
+        win_btn_row = QHBoxLayout()
+        self.arrange_btn = QPushButton("Arrange Selected")
+        self.arrange_btn.clicked.connect(self.arrange_selected_windows)
+        self.restore_btn = QPushButton("Restore Selected")
+        self.restore_btn.clicked.connect(self.restore_selected_windows)
+        self.minimize_btn = QPushButton("Minimize Selected")
+        self.minimize_btn.clicked.connect(self.minimize_selected_windows)
+        win_btn_row.addWidget(self.arrange_btn)
+        win_btn_row.addWidget(self.restore_btn)
+        win_btn_row.addWidget(self.minimize_btn)
+        layout.addLayout(win_btn_row)
 
     def log(self, msg: str) -> None:
         if callable(self.log_fn):
@@ -282,6 +348,215 @@ class InstancesPage(QWidget):
                 self._index_to_row[idx] = row
         self.table.blockSignals(False)
         self._updating_table = False
+
+    # ------------------------------------------------------------------
+    # window management
+    # ------------------------------------------------------------------
+    def _populate_monitor_dropdown(self) -> None:
+        """Populate the monitor dropdown with available monitors."""
+        self.monitor_combo.clear()
+        self.monitor_combo.addItem("Primary", 0)  # index 0 = primary
+        work_areas = WindowManager.get_monitor_work_areas()
+        for idx, (left, top, right, bottom) in enumerate(work_areas[1:], start=1):
+            self.monitor_combo.addItem(f"Monitor {idx+1}", idx)
+
+    def _on_layout_mode_changed(self) -> None:
+        """Update spinbox enabled states based on layout mode."""
+        if self.layout_cols_radio.isChecked():
+            self.cols_spin.setEnabled(True)
+            self.rows_spin.setEnabled(False)
+        elif self.layout_rows_radio.isChecked():
+            self.cols_spin.setEnabled(False)
+            self.rows_spin.setEnabled(True)
+        else:  # Auto
+            self.cols_spin.setEnabled(False)
+            self.rows_spin.setEnabled(False)
+
+    def arrange_selected_windows(self) -> None:
+        """Arrange selected instance windows on the chosen monitor."""
+        # get selected instances
+        state = self.get_app_state_fn()
+        instances = state.get_selected_instances()
+        if not instances:
+            self.log("No instances selected for window arrangement.")
+            return
+
+        monitor_idx = self.monitor_combo.currentData() or 0
+        layout_mode = "auto"
+        if self.layout_cols_radio.isChecked():
+            layout_mode = "cols"
+        elif self.layout_rows_radio.isChecked():
+            layout_mode = "rows"
+
+        cols = self.cols_spin.value()
+        rows = self.rows_spin.value()
+        padding = self.padding_spin.value()
+
+        self.log(f"Arranging {len(instances)} window(s) on monitor {monitor_idx+1}...")
+        self.task_runner.run(
+            self._arrange_windows_worker,
+            instances,
+            monitor_idx,
+            layout_mode,
+            cols,
+            rows,
+            padding,
+        )
+
+    def restore_selected_windows(self) -> None:
+        """Restore selected instance windows."""
+        state = self.get_app_state_fn()
+        instances = state.get_selected_instances()
+        if not instances:
+            self.log("No instances selected for window restore.")
+            return
+
+        self.log(f"Restoring {len(instances)} window(s)...")
+        self.task_runner.run(self._restore_windows_worker, instances)
+
+    def minimize_selected_windows(self) -> None:
+        """Minimize selected instance windows."""
+        state = self.get_app_state_fn()
+        instances = state.get_selected_instances()
+        if not instances:
+            self.log("No instances selected for window minimize.")
+            return
+
+        self.log(f"Minimizing {len(instances)} window(s)...")
+        self.task_runner.run(self._minimize_windows_worker, instances)
+
+    # ------------------------------------------------------------------
+    # window management workers
+    # ------------------------------------------------------------------
+    def _arrange_windows_worker(
+        self,
+        instances: List[Any],
+        monitor_idx: int,
+        layout_mode: str,
+        cols: int,
+        rows: int,
+        padding: int,
+        log_fn=None,
+        progress_fn=None,
+    ) -> Dict[str, bool]:
+        """Background worker to arrange windows in a grid."""
+        results: Dict[str, bool] = {}
+        work_areas = WindowManager.get_monitor_work_areas()
+        if monitor_idx >= len(work_areas):
+            monitor_idx = 0
+
+        left, top, right, bottom = work_areas[monitor_idx]
+        work_width = right - left - padding * 2
+        work_height = bottom - top - padding * 2
+
+        # compute grid dimensions
+        num_instances = len(instances)
+        if layout_mode == "cols":
+            grid_cols = cols
+            grid_rows = (num_instances + cols - 1) // cols
+        elif layout_mode == "rows":
+            grid_rows = rows
+            grid_cols = (num_instances + rows - 1) // rows
+        else:  # auto
+            import math
+            grid_cols = max(1, int(math.ceil(math.sqrt(num_instances))))
+            grid_rows = (num_instances + grid_cols - 1) // grid_cols
+
+        win_width = work_width // grid_cols
+        win_height = work_height // grid_rows
+
+        # find and arrange each window
+        windows_by_title = WindowManager.find_windows_by_title_keywords(
+            [inst.name for inst in instances]
+        )
+
+        for pos, inst in enumerate(instances):
+            hwnd = windows_by_title.get(inst.name)
+            if not hwnd:
+                msg = f"Window for '{inst.name}' not found"
+                log_fn and log_fn(msg)
+                results[inst.name] = False
+                continue
+
+            # compute grid position
+            row = pos // grid_cols
+            col = pos % grid_cols
+            x = left + padding + col * win_width
+            y = top + padding + row * win_height
+
+            ok = WindowManager.move_resize(hwnd, x, y, win_width, win_height)
+            if ok:
+                log_fn and log_fn(f"Arranged '{inst.name}' at ({row},{col})")
+                results[inst.name] = True
+            else:
+                log_fn and log_fn(f"Failed to arrange '{inst.name}'")
+                results[inst.name] = False
+
+            progress_fn and progress_fn(inst.index, int((pos + 1) * 100 / num_instances))
+
+        return results
+
+    def _restore_windows_worker(
+        self,
+        instances: List[Any],
+        log_fn=None,
+        progress_fn=None,
+    ) -> Dict[str, bool]:
+        """Background worker to restore windows."""
+        results: Dict[str, bool] = {}
+        windows_by_title = WindowManager.find_windows_by_title_keywords(
+            [inst.name for inst in instances]
+        )
+
+        for pos, inst in enumerate(instances):
+            hwnd = windows_by_title.get(inst.name)
+            if not hwnd:
+                log_fn and log_fn(f"Window for '{inst.name}' not found")
+                results[inst.name] = False
+                continue
+
+            ok = WindowManager.restore_window(hwnd)
+            if ok:
+                log_fn and log_fn(f"Restored '{inst.name}'")
+                results[inst.name] = True
+            else:
+                log_fn and log_fn(f"Failed to restore '{inst.name}'")
+                results[inst.name] = False
+
+            progress_fn and progress_fn(inst.index, int((pos + 1) * 100 / len(instances)))
+
+        return results
+
+    def _minimize_windows_worker(
+        self,
+        instances: List[Any],
+        log_fn=None,
+        progress_fn=None,
+    ) -> Dict[str, bool]:
+        """Background worker to minimize windows."""
+        results: Dict[str, bool] = {}
+        windows_by_title = WindowManager.find_windows_by_title_keywords(
+            [inst.name for inst in instances]
+        )
+
+        for pos, inst in enumerate(instances):
+            hwnd = windows_by_title.get(inst.name)
+            if not hwnd:
+                log_fn and log_fn(f"Window for '{inst.name}' not found")
+                results[inst.name] = False
+                continue
+
+            ok = WindowManager.minimize_window(hwnd)
+            if ok:
+                log_fn and log_fn(f"Minimized '{inst.name}'")
+                results[inst.name] = True
+            else:
+                log_fn and log_fn(f"Failed to minimize '{inst.name}'")
+                results[inst.name] = False
+
+            progress_fn and progress_fn(inst.index, int((pos + 1) * 100 / len(instances)))
+
+        return results
 
     # ------------------------------------------------------------------
     # background task implementations

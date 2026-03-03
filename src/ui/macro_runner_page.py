@@ -37,6 +37,7 @@ class MacroRunnerPage(QWidget):
         self.log_fn = log_fn
         self.get_state_fn = get_state_fn
         self.get_adb_manager_fn = get_adb_manager_fn
+        self._is_closing = False
 
         # state for running
         self.macro_path: str | None = None
@@ -45,6 +46,7 @@ class MacroRunnerPage(QWidget):
 
         self.task_runner = TaskRunner()
         self.task_runner.on_log.connect(self.log)
+        self.task_runner.on_error.connect(self._on_task_error)
         self.task_runner.on_progress.connect(self._on_task_progress)
         self.task_runner.on_done.connect(self._on_task_done)
 
@@ -120,6 +122,17 @@ class MacroRunnerPage(QWidget):
         if callable(self.log_fn):
             self.log_fn(msg)
 
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._is_closing = True
+        if self.stop_event:
+            self.stop_event.set()
+        super().closeEvent(event)
+
+    def _on_task_error(self, message: str) -> None:
+        if self._is_closing:
+            return
+        self.log(f"Macro task error: {message}")
+
     # ------------------------------------------------------------------
     # file selection
     # ------------------------------------------------------------------
@@ -133,6 +146,8 @@ class MacroRunnerPage(QWidget):
     # run control
     # ------------------------------------------------------------------
     def _on_run(self) -> None:
+        if self._is_closing:
+            return
         if not self.macro_path:
             self.log("Please choose a macro file first.")
             return
@@ -217,50 +232,54 @@ class MacroRunnerPage(QWidget):
         log_fn=None,
         progress_fn=None,
     ) -> Dict[int, Any]:
-        adb: ADBManager = self.get_adb_manager_fn()
         results: Dict[int, Any] = {}
+        try:
+            adb: ADBManager = self.get_adb_manager_fn()
 
-        def run_single(inst):
-            engine = MacroEngine(pixel_jitter=pixel_jitter, delay_jitter_ms=delay_jitter, log_fn=log_fn or (lambda m: None))
-            final_res = {"success": True, "errors": []}
-            for _ in range(repeat):
-                if stop_event.is_set():
-                    final_res["success"] = False
-                    final_res["errors"].append("stopped")
-                    break
-                res = engine.run_macro_on_device(
-                    adb,
-                    inst.adb_serial,
-                    macro,
-                    stop_event,
-                    progress_fn,
-                    inst.index,
+            def run_single(inst):
+                engine = MacroEngine(
+                    pixel_jitter=pixel_jitter,
+                    delay_jitter_ms=delay_jitter,
+                    log_fn=log_fn or (lambda m: None),
                 )
-                # merge results; if any iteration fails mark overall failure
-                if not res.get("success"):
-                    final_res["success"] = False
-                    final_res["errors"].extend(res.get("errors", []))
-            results[inst.index] = final_res
+                final_res = {"success": True, "errors": []}
+                for _ in range(repeat):
+                    if stop_event.is_set():
+                        final_res["success"] = False
+                        final_res["errors"].append("stopped")
+                        break
+                    res = engine.run_macro_on_device(
+                        adb,
+                        inst.adb_serial,
+                        macro,
+                        stop_event,
+                        progress_fn,
+                        inst.index,
+                    )
+                    if not res.get("success"):
+                        final_res["success"] = False
+                        final_res["errors"].extend(res.get("errors", []))
+                results[inst.index] = final_res
 
-        if parallel:
-            threads: List[threading.Thread] = []
-            for inst in instances:
-                if stop_event.is_set():
-                    break
-                t = threading.Thread(target=run_single, args=(inst,))
-                t.start()
-                threads.append(t)
-                if not parallel and stagger_delay:
-                    time.sleep(stagger_delay)
-            for t in threads:
-                t.join()
-        else:
-            for inst in instances:
-                if stop_event.is_set():
-                    break
-                run_single(inst)
-                if stagger_delay:
-                    time.sleep(stagger_delay)
+            if parallel:
+                threads: List[threading.Thread] = []
+                for inst in instances:
+                    if stop_event.is_set():
+                        break
+                    t = threading.Thread(target=run_single, args=(inst,))
+                    t.start()
+                    threads.append(t)
+                for t in threads:
+                    t.join()
+            else:
+                for inst in instances:
+                    if stop_event.is_set():
+                        break
+                    run_single(inst)
+                    if stagger_delay:
+                        time.sleep(stagger_delay)
+        except Exception as exc:  # pragma: no cover - defensive
+            log_fn and log_fn(f"Macro worker failed: {exc}")
 
         return results
 
@@ -268,6 +287,8 @@ class MacroRunnerPage(QWidget):
     # signal handlers
     # ------------------------------------------------------------------
     def _on_task_progress(self, instance_id: int, percent: int) -> None:
+        if self._is_closing:
+            return
         row = self._row_for_index.get(instance_id)
         if row is None:
             return
@@ -276,6 +297,8 @@ class MacroRunnerPage(QWidget):
             self.table.setItem(row, 3, QTableWidgetItem("running"))
 
     def _on_task_done(self, result: Any) -> None:
+        if self._is_closing:
+            return
         # worker returned results map
         if isinstance(result, dict):
             for idx, info in result.items():

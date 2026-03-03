@@ -1,4 +1,4 @@
-from PySide6.QtCore import Qt, QDateTime
+from PySide6.QtCore import Qt, QDateTime, QObject, Signal
 from PySide6.QtWidgets import (
     QMainWindow,
     QTabWidget,
@@ -13,6 +13,10 @@ from .setup_page import SetupPage
 from .instances_page import InstancesPage
 from .app_launcher_page import AppLauncherPage
 from .macro_runner_page import MacroRunnerPage
+
+
+class LogBus(QObject):
+    message = Signal(str)
 
 
 class MainWindow(QMainWindow):
@@ -34,6 +38,8 @@ class MainWindow(QMainWindow):
 
         # ensure log widget exists before any page may call log()
         self._create_log_panel()
+        self.log_bus = LogBus(self)
+        self.log_bus.message.connect(self._append_log)
         self._create_tabs()
 
     # ------------------------------------------------------------------
@@ -45,10 +51,18 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
 
-        self.setup_tab = SetupPage(self.log)
-        self.instances_tab = InstancesPage(self.log, self.get_config, self.get_app_state)
-        self.app_launcher_tab = AppLauncherPage(self.log, self.get_app_state, self.get_adb_manager)
-        self.macros_tab = MacroRunnerPage(self.log, self.get_app_state, self.get_adb_manager)
+        self.setup_tab = SetupPage(self.log_bus.message.emit)
+        self.instances_tab = InstancesPage(self.log_bus.message.emit, self.get_config, self.get_app_state)
+        self.app_launcher_tab = AppLauncherPage(
+            self.log_bus.message.emit,
+            self.get_app_state,
+            self.get_adb_manager,
+        )
+        self.macros_tab = MacroRunnerPage(
+            self.log_bus.message.emit,
+            self.get_app_state,
+            self.get_adb_manager,
+        )
 
         self.tabs.addTab(self.setup_tab, "Setup")
         self.tabs.addTab(self.instances_tab, "Instances")
@@ -85,10 +99,10 @@ class MainWindow(QMainWindow):
         """Get or create an ADB manager using the current config."""
         if self._adb_manager is None:
             cfg = self.get_config()
-            self._adb_manager = ADBManager(cfg.get("adb_path", ""), self.log)
+            self._adb_manager = ADBManager(cfg.get("adb_path", ""), self.log_bus.message.emit)
         return self._adb_manager
 
-    def log(self, message: str) -> None:
+    def _append_log(self, message: str) -> None:
         """Append ``message`` to the log panel with a timestamp.
 
         The timestamp is formatted as ``YYYY-MM-DD HH:MM:SS``.  This method
@@ -98,3 +112,6 @@ class MainWindow(QMainWindow):
 
         timestamp = QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss")
         self.log_widget.appendPlainText(f"[{timestamp}] {message}")
+
+    def log(self, message: str) -> None:
+        self.log_bus.message.emit(message)

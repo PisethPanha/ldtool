@@ -30,6 +30,7 @@ class TaskRunner(QObject):
     on_log = Signal(str)
     on_progress = Signal(int, int)
     on_done = Signal(object)
+    on_error = Signal(str)
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
@@ -58,12 +59,17 @@ class TaskRunner(QObject):
             self.setAutoDelete(True)
 
         def run(self) -> None:
-            # prepare callbacks that emit the owner's signals
+            def safe_emit(signal: Signal, *params: Any) -> None:
+                try:
+                    signal.emit(*params)
+                except Exception:  # pragma: no cover - defensive
+                    pass
+
             def log_fn(msg: str) -> None:
-                self.owner.on_log.emit(msg)
+                safe_emit(self.owner.on_log, msg)
 
             def progress_fn(instance_id: int, percent: int) -> None:
-                self.owner.on_progress.emit(instance_id, percent)
+                safe_emit(self.owner.on_progress, instance_id, percent)
 
             try:
                 result = self.func(
@@ -72,8 +78,11 @@ class TaskRunner(QObject):
                     log_fn=log_fn,
                     progress_fn=progress_fn,
                 )
-            except Exception as exc:  # catch all to prevent thread crash
-                self.owner.on_log.emit(f"task raised exception: {exc}")
-                self.owner.on_done.emit(exc)
-            else:
-                self.owner.on_done.emit(result)
+            except Exception as exc:  # pragma: no cover - defensive
+                error_msg = f"task execution failed: {type(exc).__name__}: {exc}"
+                safe_emit(self.owner.on_error, error_msg)
+                safe_emit(self.owner.on_log, error_msg)
+                safe_emit(self.owner.on_done, None)
+                return
+
+            safe_emit(self.owner.on_done, result)
