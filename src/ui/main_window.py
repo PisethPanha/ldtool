@@ -13,10 +13,20 @@ from .setup_page import SetupPage
 from .instances_page import InstancesPage
 from .app_launcher_page import AppLauncherPage
 from .macro_runner_page import MacroRunnerPage
+from .reels_poster_page import ReelsPosterPage
 
 
 class LogBus(QObject):
     message = Signal(str)
+
+
+class AdbKeyboardInstallBus(QObject):
+    """Signal bus for ADBKeyboard installation requests.
+    
+    Worker threads emit install_requested signal.
+    UI thread handles the signal by showing the dialog.
+    """
+    install_requested = Signal(object)  # Signal(ADBKeyboardRequest)
 
 
 class MainWindow(QMainWindow):
@@ -40,6 +50,14 @@ class MainWindow(QMainWindow):
         self._create_log_panel()
         self.log_bus = LogBus(self)
         self.log_bus.message.connect(self._append_log)
+        
+        # ADBKeyboard install bus for thread-safe dialog handling
+        self.adbkeyboard_install_bus = AdbKeyboardInstallBus(self)
+        self.adbkeyboard_install_bus.install_requested.connect(
+            self._handle_adbkeyboard_install_request,
+            Qt.QueuedConnection  # Ensure UI thread execution
+        )
+        
         self._create_tabs()
 
     # ------------------------------------------------------------------
@@ -63,11 +81,19 @@ class MainWindow(QMainWindow):
             self.get_app_state,
             self.get_adb_manager,
         )
+        self.reels_poster_tab = ReelsPosterPage(
+            self.log_bus.message.emit,
+            self.get_config,
+            self.get_app_state,
+            self.get_adb_manager,
+            self.adbkeyboard_install_bus,
+        )
 
         self.tabs.addTab(self.setup_tab, "Setup")
         self.tabs.addTab(self.instances_tab, "Instances")
         self.tabs.addTab(self.app_launcher_tab, "App Launcher")
         self.tabs.addTab(self.macros_tab, "Macros")
+        self.tabs.addTab(self.reels_poster_tab, "Reels Poster")
 
     def _create_log_panel(self) -> None:
         """Create a dockable, read‑only text widget for logging.
@@ -115,3 +141,47 @@ class MainWindow(QMainWindow):
 
     def log(self, message: str) -> None:
         self.log_bus.message.emit(message)
+
+    # ------------------------------------------------------------------
+    # ADBKeyboard Installation Handler (UI Thread)
+    # ------------------------------------------------------------------
+    def _handle_adbkeyboard_install_request(self, request) -> None:
+        """Handle ADBKeyboard installation request in the UI thread.
+        
+        This method is connected to adbkeyboard_install_bus.install_requested signal
+        with Qt.QueuedConnection, ensuring it always runs in the main UI thread
+        even when the signal is emitted from a worker thread.
+        
+        Args:
+            request: ADBKeyboardRequest object from the worker thread
+        """
+        serial = request.serial
+        self.log(f"[{serial}] ===== ADBKeyboard Install Request Handler (UI Thread) =====")
+        self.log(f"[{serial}] Showing ADBKeyboard installation dialog...")
+        
+        try:
+            from .adbkeyboard_install_dialog import ADBKeyboardInstallDialog
+            
+            # Create and show dialog in UI thread (safe)
+            dialog = ADBKeyboardInstallDialog(
+                parent=self,  # Main window as parent
+                adb=self.get_adb_manager(),
+                serial=serial,
+                log_fn=self.log,
+            )
+            
+            # Show modal dialog (blocks UI thread until user completes/cancels)
+            success = dialog.exec() == dialog.Accepted and dialog.install_success
+            
+            # Set result to unblock the worker thread
+            if success:
+                self.log(f"[{serial}] ✓ User completed ADBKeyboard installation successfully")
+                request.set_result(True, None)
+            else:
+                self.log(f"[{serial}] ✗ User cancelled or installation failed")
+                request.set_result(False, "Installation cancelled or failed")
+                
+        except Exception as e:
+            error_msg = f"Failed to show ADBKeyboard dialog: {e}"
+            self.log(f"[{serial}] ✗ {error_msg}")
+            request.set_result(False, error_msg)
