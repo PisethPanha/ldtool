@@ -30,6 +30,9 @@ from src.core.ui_dump import (
 	open_profile_tab,
 	_debug_dump_artifacts,
 )
+from src.core.caption_helpers import build_default_reel_caption, clean_caption_text
+from src.core.ai_caption_service import AICaptionService
+from src.core.smart_title_service import SmartTitleService
 
 
 # ------------------------------------------------------------------
@@ -47,6 +50,7 @@ class ReelState(Enum):
 	PRESS_HOME = "PRESS_HOME"
 	OPEN_FILE_MANAGER = "OPEN_FILE_MANAGER"
 	SELECT_PICTURES = "SELECT_PICTURES"
+	NAVIGATE_TO_SUBFOLDER = "NAVIGATE_TO_SUBFOLDER"
 	NAVIGATE_MEDIA = "NAVIGATE_MEDIA"
 	HOLD_ON_MEDIA = "HOLD_ON_MEDIA"
 	CLICK_ON_SEND = "CLICK_ON_SEND"
@@ -78,6 +82,7 @@ STATE_POLICIES: dict[ReelState, StatePolicy] = {
 	ReelState.PRESS_HOME: StatePolicy(timeout_s=5, retries=1, expected_package=None),
 	ReelState.OPEN_FILE_MANAGER: StatePolicy(timeout_s=12, retries=2, expected_package=None),
 	ReelState.SELECT_PICTURES: StatePolicy(timeout_s=20, retries=2, expected_package="com.cyanogenmod.filemanager"),
+	ReelState.NAVIGATE_TO_SUBFOLDER: StatePolicy(timeout_s=15, retries=2, expected_package="com.cyanogenmod.filemanager"),
 	ReelState.NAVIGATE_MEDIA: StatePolicy(timeout_s=15, retries=2, expected_package="com.cyanogenmod.filemanager"),
 	ReelState.HOLD_ON_MEDIA: StatePolicy(timeout_s=15, retries=2, expected_package="com.cyanogenmod.filemanager"),
 	ReelState.CLICK_ON_SEND: StatePolicy(timeout_s=15, retries=2, expected_package="com.cyanogenmod.filemanager"),
@@ -320,6 +325,7 @@ class ReelPoster:
 		fallback_push_if_missing: bool = False,
 		keep_caption_extension: bool = False,
 		get_adbkeyboard_request_fn: Optional[Callable[[str], ADBKeyboardRequest]] = None,
+		get_config_fn: Optional[Callable[[], dict[str, Any]]] = None,
 	):
 		self.adb = adb
 		self.log_fn = log_fn
@@ -327,6 +333,7 @@ class ReelPoster:
 		self.fallback_push_if_missing = fallback_push_if_missing  # If True, push from PC if not found on emulator
 		self.keep_caption_extension = keep_caption_extension
 		self.get_adbkeyboard_request_fn = get_adbkeyboard_request_fn  # Callback to create ADBKeyboardRequest (called from worker thread)
+		self.get_config_fn = get_config_fn or (lambda: {})  # Callback to get config dict
 		self._relaunch_count = 0  # Track relaunch attempts per job
 		self._android_media_path: str | None = None  # Path on Android device after adb push
 		self._android_media_name: str | None = None  # Filename on Android device
@@ -515,6 +522,11 @@ class ReelPoster:
 			(ReelState.PRESS_HOME, self._state_press_home),
 			(ReelState.OPEN_FILE_MANAGER, self._state_open_file_manager),
 			(ReelState.SELECT_PICTURES, self._state_select_pictures),
+		]
+		# Only add NAVIGATE_TO_SUBFOLDER if job.have_subfolder is True
+		if job.have_subfolder:
+			states.append((ReelState.NAVIGATE_TO_SUBFOLDER, self._state_navigate_to_subfolder))
+		states.extend([
 			(ReelState.NAVIGATE_MEDIA, self._state_navigate_media),
 			(ReelState.HOLD_ON_MEDIA, self._state_hold_on_media),
 			(ReelState.CLICK_ON_SEND, self._state_click_on_send),
@@ -524,7 +536,7 @@ class ReelPoster:
 			(ReelState.FILL_CAPTION, self._state_fill_caption),
 			(ReelState.CONFIGURE_SCHEDULE, self._state_configure_schedule),
 			(ReelState.TAP_SHARE, self._state_tap_share),
-		]
+		])
 
 		for state, handler in states:
 			policy = STATE_POLICIES[state]
@@ -1265,15 +1277,12 @@ class ReelPoster:
 		max_attempts = 3
 		attempt = 0
 
+
 		while time.time() < end_at and attempt < max_attempts:
 			attempt += 1
 			self._log(f"[{serial}] SELECT_PICTURES attempt {attempt}/{max_attempts}")
 
-			# Step 1: Check if already in Pictures
-			xml = dump_ui_xml(self.adb, serial)
-			if xml and self._is_in_shared_pictures(xml):
-				self._log(f"[{serial}] ✓ Already in shared/Pictures (breadcrumb verified)")
-				return True, None
+			# Step 1: (Breadcrumb verification removed)
 
 			# Step 2: Ensure File Manager is in foreground
 			if self._get_foreground_package(serial) != "com.cyanogenmod.filemanager":
@@ -1287,6 +1296,7 @@ class ReelPoster:
 			max_scrolls = 8
 			found_and_tapped = False
 
+
 			while scroll_attempts < max_scrolls:
 				xml = dump_ui_xml(self.adb, serial)
 				if not xml:
@@ -1295,59 +1305,322 @@ class ReelPoster:
 
 				# Try to find Pictures folder row
 				pictures_bounds = self._find_folder_row_bounds(xml, "Pictures")
-				
+
 				if pictures_bounds:
 					self._log(f"[{serial}] Found Pictures folder row, tapping...")
 					tap_center(self.adb, serial, pictures_bounds)
 					time.sleep(0.6)
 					found_and_tapped = True
 					break
-				
+
 				# Pictures not visible, scroll down to find it
 				self._log(f"[{serial}] Pictures row not visible, scrolling... ({scroll_attempts + 1}/{max_scrolls})")
 				swipe(self.adb, serial, 360, 1040, 360, 600, 300)
 				time.sleep(0.4)
 				scroll_attempts += 1
 
+			# If not found after scroll, press BACK once and scroll to refind
 			if not found_and_tapped:
-				self._log(f"[{serial}] Pictures folder row not found after scrolling")
-				# Try fallback: search approach
-				xml = dump_ui_xml(self.adb, serial)
-				if xml:
-					search_btn = find_first(xml, {"res_id_contains": "ab_search", "clickable": True})
-					if search_btn:
-						self._log(f"[{serial}] Trying search fallback...")
-						tap_center(self.adb, serial, search_btn)
-						time.sleep(0.35)
-						self.adb.shell(serial, "input text Pictures")
-						time.sleep(0.35)
-						self.adb.shell(serial, "input keyevent KEYCODE_ENTER")
-						time.sleep(0.5)
-						xml2 = dump_ui_xml(self.adb, serial)
-						if xml2:
-							pics_result = find_first(xml2, {"text_contains": "Pictures", "clickable": True})
-							if pics_result:
-								tap_center(self.adb, serial, pics_result)
-								time.sleep(0.6)
-								found_and_tapped = True
+				self._log(f"[{serial}] Pictures folder row not found after scrolling, pressing BACK once and retrying...")
+				self.adb.shell(serial, "input keyevent KEYCODE_BACK")
+				time.sleep(0.6)
+				scroll_attempts = 0
+				while scroll_attempts < max_scrolls:
+					xml = dump_ui_xml(self.adb, serial)
+					if not xml:
+						time.sleep(0.3)
+						continue
+					pictures_bounds = self._find_folder_row_bounds(xml, "Pictures")
+					if pictures_bounds:
+						self._log(f"[{serial}] Found Pictures folder row after BACK, tapping...")
+						tap_center(self.adb, serial, pictures_bounds)
+						time.sleep(0.6)
+						found_and_tapped = True
+						break
+					self._log(f"[{serial}] Pictures row not visible after BACK, scrolling... ({scroll_attempts + 1}/{max_scrolls})")
+					swipe(self.adb, serial, 360, 1040, 360, 600, 300)
+					time.sleep(0.4)
+					scroll_attempts += 1
 
-			# Step 4: Verify breadcrumb shows we're in Pictures
-			verify_end = time.time() + 3.0
-			while time.time() < verify_end:
-				xml_verify = dump_ui_xml(self.adb, serial)
-				if xml_verify and self._is_in_shared_pictures(xml_verify):
-					self._log(f"[{serial}] ✓ Pictures folder opened (breadcrumb: shared > Pictures)")
-					return True, None
-				time.sleep(0.4)
+			# If still not found, press BACK again and scroll to refind
+			if not found_and_tapped:
+				self._log(f"[{serial}] Pictures folder row still not found, pressing BACK again and retrying...")
+				self.adb.shell(serial, "input keyevent KEYCODE_BACK")
+				time.sleep(0.6)
+				scroll_attempts = 0
+				while scroll_attempts < max_scrolls:
+					xml = dump_ui_xml(self.adb, serial)
+					if not xml:
+						time.sleep(0.3)
+						continue
+					pictures_bounds = self._find_folder_row_bounds(xml, "Pictures")
+					if pictures_bounds:
+						self._log(f"[{serial}] Found Pictures folder row after second BACK, tapping...")
+						tap_center(self.adb, serial, pictures_bounds)
+						time.sleep(0.6)
+						found_and_tapped = True
+						break
+					self._log(f"[{serial}] Pictures row not visible after second BACK, scrolling... ({scroll_attempts + 1}/{max_scrolls})")
+					swipe(self.adb, serial, 360, 1040, 360, 600, 300)
+					time.sleep(0.4)
+					scroll_attempts += 1
 
-			# Verification failed, log and retry
+			# Step 4: (Breadcrumb verification removed)
+			# Always proceed after attempting to tap Pictures, regardless of breadcrumb
+			if found_and_tapped:
+				self._log(f"[{serial}] Pictures folder tap attempted, proceeding without breadcrumb verification.")
+				return True, None
+
+			# If not found, log and retry
 			self._log(
-				f"[{serial}] Pictures folder did not open (breadcrumb verification failed), "
-				f"retrying... (attempt {attempt}/{max_attempts})"
+				f"[{serial}] Pictures folder did not open, retrying... (attempt {attempt}/{max_attempts})"
 			)
 			time.sleep(0.5)
 
-		return False, "SELECT_PICTURES failed: Pictures folder did not open (breadcrumb not shared/Pictures)"
+		return False, "SELECT_PICTURES failed: Pictures folder did not open after all attempts."
+
+	def _state_navigate_to_subfolder(
+		self,
+		serial: str,
+		job: ReelJob,
+		device_media_path: str,
+		timeout_s: int,
+	) -> tuple[bool, str | None]:
+		"""Navigate into a subfolder inside Pictures.
+
+		Skips immediately when subfolder mode is disabled.
+		Fails immediately when the folder name is empty.
+
+		Tap strategy (tried in order per attempt):
+		  1. Expanded row bounds  (full-width container around the label)
+		  2. Label centre         (the TextView itself)
+		  3. Left-of-label tap   (icon/row area to the left of the text)
+
+		Verification passes when ANY of the following holds after a tap:
+		  A. Breadcrumb contains the subfolder name.
+		  B. Folder label is gone AND the target media file is now visible.
+		  C. Folder label is gone (contents changed).
+		"""
+		if job.have_subfolder == False:
+			self._log(f"[{serial}] Subfolder mode disabled, skipping NAVIGATE_TO_SUBFOLDER")
+			return True, None
+
+		folder = job.subfolder_name.strip()
+		if not folder:
+			return False, "Subfolder name cannot be empty."
+
+		media_filename = (job.media_path or "").replace("\\", "/").split("/")[-1]
+
+		# Check if already inside the target subfolder (breadcrumb verification)
+		xml_check = dump_ui_xml(self.adb, serial)
+		if xml_check and self._is_in_subfolder(xml_check, folder):
+			self._log(f"[{serial}] ✓ Already in subfolder '{folder}' (breadcrumb verified)")
+			return True, None
+
+		self._log(f"[{serial}] Opening subfolder: {folder}")
+
+		# ---- locate label (scroll down, then Back + scroll again if needed) ----
+		label_bounds: tuple[int, int, int, int] | None = None
+		max_scrolls = 6
+
+		def _scroll_and_find() -> tuple[int, int, int, int] | None:
+			"""Scroll down up to max_scrolls times looking for the subfolder label."""
+			for scroll_i in range(max_scrolls):
+				xml = dump_ui_xml(self.adb, serial)
+				if xml:
+					found = self._find_subfolder_label_bounds(xml, folder)
+					if found:
+						return found
+				self._log(
+					f"[{serial}] '{folder}' not visible, scrolling "
+					f"({scroll_i + 1}/{max_scrolls})..."
+				)
+				swipe(self.adb, serial, 360, 1040, 360, 600, 300)
+				time.sleep(0.4)
+			return None
+
+		label_bounds = _scroll_and_find()
+
+		if not label_bounds:
+			# Press Back to reset the list to the top, then try one more time
+			self._log(f"[{serial}] '{folder}' not found after scrolling, pressing Back and retrying...")
+			self.adb.shell(serial, "input keyevent KEYCODE_BACK")
+			time.sleep(0.6)
+			label_bounds = _scroll_and_find()
+
+		if not label_bounds:
+			return False, f"Subfolder '{folder}' not found in Pictures"
+
+		lx1, ly1, lx2, ly2 = label_bounds
+		label_cx = (lx1 + lx2) // 2
+		label_cy = (ly1 + ly2) // 2
+		row_bounds = self._build_folder_row_bounds(label_bounds)
+
+		self._log(
+			f"[{serial}] Found subfolder label: {folder} at "
+			f"[{lx1},{ly1}][{lx2},{ly2}]"
+		)
+		self._log(
+			f"[{serial}] Expanded row bounds: "
+			f"[{row_bounds[0]},{row_bounds[1]}][{row_bounds[2]},{row_bounds[3]}]"
+		)
+
+		# Three tap targets tried in sequence across up to 3 attempts
+		tap_targets: list[tuple[str, tuple[int, int, int, int]]] = [
+			("expanded row centre", row_bounds),
+			(
+				"label centre",
+				(lx1, ly1, lx2, ly2),
+			),
+			(
+				"left-row area",
+				(
+					max(0, lx1 - 80),
+					ly1,
+					max(48, lx1 - 80) + 1,
+					ly2,
+				),
+			),
+		]
+
+		for attempt_i, (tap_label, tap_bounds) in enumerate(tap_targets, start=1):
+			self._log(f"[{serial}] Tapping {tap_label}...")
+			tap_center(self.adb, serial, tap_bounds)
+			time.sleep(0.8)
+
+			self._log(f"[{serial}] Verifying navigation...")
+			verified = False
+			verify_end = time.time() + 2.5
+			while time.time() < verify_end:
+				xml_v = dump_ui_xml(self.adb, serial)
+				if not xml_v:
+					time.sleep(0.3)
+					continue
+
+				# A: breadcrumb contains subfolder name
+				if self._is_in_subfolder(xml_v, folder):
+					verified = True
+					break
+
+				label_gone = self._find_subfolder_label_bounds(xml_v, folder) is None
+
+				# B: label gone + media file visible
+				if label_gone and media_filename and self._find_file_name_bounds(xml_v, media_filename) is not None:
+					verified = True
+					break
+
+				# C: label simply gone (subfolder was empty or very fast load)
+				if label_gone:
+					verified = True
+					break
+
+				time.sleep(0.35)
+
+			if verified:
+				self._log(f"[{serial}] ✓ SUBFOLDER opened: {folder}")
+				return True, None
+
+			if attempt_i < len(tap_targets):
+				self._log(
+					f"[{serial}] Navigation not confirmed, retrying with "
+					f"{tap_targets[attempt_i][0]}..."
+				)
+
+		return False, f"Subfolder '{folder}' could not be opened."
+
+	# ------------------------------------------------------------------
+	# Subfolder navigation helpers
+	# ------------------------------------------------------------------
+
+	def _find_subfolder_label_bounds(
+		self, xml: str, subfolder_name: str
+	) -> tuple[int, int, int, int] | None:
+		"""Return the raw bounds of the ``navigation_view_item_name`` TextView
+		whose text matches *subfolder_name* (case-insensitive).
+
+		These are the label bounds only — not the clickable container.
+		Use :meth:`_build_folder_row_bounds` to expand them to the full row.
+		"""
+		if not xml:
+			return None
+		try:
+			root = ET.fromstring(xml)
+		except ET.ParseError:
+			return None
+
+		target = subfolder_name.lower()
+		for node in root.iter():
+			a = node.attrib
+			if (
+				a.get("resource-id") == "com.cyanogenmod.filemanager:id/navigation_view_item_name"
+				and a.get("class") == "android.widget.TextView"
+				and a.get("text", "").lower() == target
+			):
+				bounds_txt = a.get("bounds", "")
+				try:
+					coords = tuple(
+						map(
+							int,
+							bounds_txt.replace("][", ",").replace("[", "").replace("]", "").split(","),
+						)
+					)
+					if len(coords) == 4:
+						return coords  # type: ignore[return-value]
+				except (ValueError, AttributeError):
+					continue
+		return None
+
+	@staticmethod
+	def _build_folder_row_bounds(
+		label_bounds: tuple[int, int, int, int],
+		screen_width: int = 720,
+		screen_height: int = 1280,
+	) -> tuple[int, int, int, int]:
+		"""Expand label bounds to the full clickable row rectangle.
+
+		CM File Manager rows span the full screen width; the label sits in the
+		right ~70 % of the row.  Expanding left to x=24 and padding ±28 px
+		vertically covers the whole row reliably.
+		"""
+		_lx1, ly1, lx2, ly2 = label_bounds
+		row_x1 = 24
+		row_x2 = min(lx2, screen_width - 16)
+		row_y1 = max(0, ly1 - 28)
+		row_y2 = min(screen_height, ly2 + 28)
+		return (row_x1, row_y1, row_x2, row_y2)
+
+	def _find_folder_row_bounds_ci(self, xml: str, folder_name: str) -> tuple[int, int, int, int] | None:
+		"""Return expanded row bounds for *folder_name* (case-insensitive).
+
+		Convenience wrapper: finds the label then builds the full row bounds.
+		Used by NAVIGATE_MEDIA guard and other callers that only need a single
+		bounds value.
+		"""
+		label = self._find_subfolder_label_bounds(xml, folder_name)
+		if label is None:
+			return None
+		return self._build_folder_row_bounds(label)
+
+	def _is_in_subfolder(self, xml: str, subfolder_name: str) -> bool:
+		"""Return True when the File Manager breadcrumb contains *subfolder_name*.
+
+		The breadcrumb for ``shared/Pictures/MindReg`` would expose three
+		``breadcrumb_item`` nodes: "shared", "Pictures", "MindReg".
+		A case-insensitive substring match on the last item is sufficient.
+		"""
+		if not xml:
+			return False
+		try:
+			root = ET.fromstring(xml)
+		except ET.ParseError:
+			return False
+
+		target = subfolder_name.lower()
+		for node in root.iter():
+			if "breadcrumb_item" in node.attrib.get("resource-id", ""):
+				if target in node.attrib.get("text", "").lower():
+					return True
+		return False
 
 	def _state_navigate_media(
 		self,
@@ -1782,21 +2055,103 @@ class ReelPoster:
 	) -> tuple[bool, str | None]:
 		"""Fill caption/description field using filename (without extension).
 		
-		Always computes caption from filename, ignoring job.caption.
-		This ensures consistency and reliability.
+		If AI retitling is enabled, use AI caption service to generate title and description.
+		Otherwise, use default caption generation from filename.
+		Supports per-job AI caching to avoid repeated API calls.
 		"""
 		# Compute caption from filename (without extension)
-		caption_to_use = self._android_media_name or (Path(job.media_path).name if job.media_path else "")
-		if not caption_to_use:
+		filename = self._android_media_name or (Path(job.media_path).name if job.media_path else "")
+		if not filename:
 			return False, "Cannot determine media filename for caption"
 		
-		# Strip extension to get clean caption
-		caption_to_use = Path(caption_to_use).stem
-		if not caption_to_use:
+		# Strip extension to get clean filename stem
+		filename_stem = Path(filename).stem
+		if not filename_stem:
 			return False, "Filename stem is empty after removing extension"
 		
-		self._log(f"[{serial}] Caption source: filename={caption_to_use!r}")
-		return self._helper_fill_caption(serial, caption_to_use, timeout_s)
+		# Step 1: Generate base caption (Smart Title or default)
+		base_caption_dict = None
+		
+		# Try Smart Title by Bot if enabled
+		if job.use_smart_title:
+			self._log(f"[{serial}] Smart Title enabled: True")
+			try:
+				smart_service = SmartTitleService(self._log)
+				base_caption_dict = smart_service.parse_filename(filename)
+				self._log(f"[{serial}] Caption source: Smart Title parsing")
+			except Exception as e:
+				self._log(f"[{serial}] ⚠ Smart Title failed: {e}, using default")
+				base_caption_dict = None
+		else:
+			self._log(f"[{serial}] Smart Title enabled: False")
+		
+		# Fallback to default caption if Smart Title disabled or failed
+		if not base_caption_dict:
+			base_caption_dict = build_default_reel_caption(filename_stem)
+			self._log(f"[{serial}] Caption source: filename={filename_stem!r}")
+		
+		# Step 2: Apply AI Retitle if enabled (uses base caption as input)
+		if job.use_ai_retitle and not job.ai_caption_cache:
+			self._log(f"[{serial}] AI retitle enabled: True")
+			self._log(f"[{serial}] AI target language: {job.ai_target_language}")
+			
+			# Check if we have an API key (via config)
+			config = self.get_config_fn()
+			api_key = config.get("gemini_api_key", "").strip()
+			
+			has_key = bool(api_key)
+			self._log(f"[{serial}] Gemini API key present: {'yes' if has_key else 'no'}")
+			
+			if api_key:
+				try:
+					self._log(f"[{serial}] Creating Gemini service...")
+					service = AICaptionService(api_key, self._log)
+					
+					# Check if service initialized successfully
+					is_ready, init_error = service.is_ready()
+					if not is_ready:
+						self._log(f"[{serial}] ✗ Gemini unavailable: {init_error}")
+						self._log(f"[{serial}] Using base caption as fallback")
+						job.ai_caption_cache = None
+					else:
+						self._log(f"[{serial}] ✓ Gemini service ready, generating caption...")
+						# Pass the base caption title (from Smart Title or default) to AI
+						input_title = base_caption_dict.get("title", filename_stem)
+						success, ai_caption_dict, error = service.generate_reel_caption(
+							input_title,
+							job.ai_target_language
+						)
+						
+						if success and ai_caption_dict:
+							job.ai_caption_cache = ai_caption_dict
+							self._log(f"[{serial}] ✓ AI caption generated: title={ai_caption_dict.get('title')!r}")
+						else:
+							self._log(f"[{serial}] ⚠ AI caption failed: {error}, using base caption")
+							job.ai_caption_cache = None  # Fallback to base
+				except Exception as e:
+					self._log(f"[{serial}] ⚠ AI caption exception: {e}, using base caption")
+					job.ai_caption_cache = None  # Fallback to base
+			else:
+				self._log(f"[{serial}] ⚠ AI retitle enabled but no API key configured, using base caption")
+				job.ai_caption_cache = None  # Fallback to base
+		else:
+			if not job.use_ai_retitle:
+				self._log(f"[{serial}] AI retitle enabled: False")
+			elif job.ai_caption_cache:
+				self._log(f"[{serial}] AI retitle enabled: True (using cached caption)")
+		
+		# Step 3: Determine final caption (AI cache → base caption)
+		if job.ai_caption_cache:
+			caption_to_use = job.ai_caption_cache
+			self._log(f"[{serial}] Using AI caption (cached)")
+		else:
+			caption_to_use = base_caption_dict
+			self._log(f"[{serial}] Using base caption")
+		
+		title = caption_to_use.get("title", filename_stem)
+		description = caption_to_use.get("description", title)
+		
+		return self._helper_fill_caption(serial, title, timeout_s, description=description)
 
 	def _state_configure_schedule(
 		self,
@@ -1815,8 +2170,18 @@ class ReelPoster:
 		device_media_path: str,
 		timeout_s: int,
 	) -> tuple[bool, str | None]:
-		"""Tap 'Share now' button."""
-		return self._helper_share(serial, timeout_s)
+		"""Tap 'Share now' button, then press Back 5 times to exit the composer."""
+		ok, err = self._helper_share(serial, timeout_s)
+		if not ok:
+			return False, err
+
+		self._log(f"[{serial}] TAP_SHARE complete — pressing Back 5 times to exit composer...")
+		for i in range(1, 6):
+			self.adb.shell(serial, "input keyevent KEYCODE_BACK")
+			self._log(f"[{serial}] Back {i}/5")
+			time.sleep(1.0)
+
+		return True, None
 
 	def _state_wait_completion(
 		self,
@@ -2104,11 +2469,22 @@ class ReelPoster:
 			self._log(f"[{serial}] Confirmation check failed: {e}")
 			return False
 
-	def _helper_fill_caption(self, serial: str, caption: str, timeout_s: int) -> tuple[bool, str | None]:
-		"""Fill Title and Describe fields on Reel Settings screen with the same caption text."""
+	def _helper_fill_caption(self, serial: str, caption: str, timeout_s: int, description: str | None = None) -> tuple[bool, str | None]:
+		"""Fill Title and Describe fields on Reel Settings screen with caption and optional description.
+		
+		Args:
+			serial: Device serial number
+			caption: Text to fill in Title field
+			timeout_s: Timeout in seconds
+			description: Optional text for Describe field. If None, uses caption for both fields.
+		"""
 		if not caption.strip():
 			self._log(f"[{serial}] No caption provided, skipping")
 			return True, None
+		
+		# Use caption as fallback for description
+		if description is None:
+			description = caption
 		
 		# Step 1: Verify we are on the reel composer screen
 		xml = dump_ui_xml(self.adb, serial)
@@ -2244,10 +2620,10 @@ class ReelPoster:
 		time.sleep(0.6)
 		
 		# Input caption via ADB IME
-		self._log(f"[{serial}] Filling Describe with: {caption!r}")
-		if not self._adb_ime_commit_text(serial, caption):
+		self._log(f"[{serial}] Filling Describe with: {description!r}")
+		if not self._adb_ime_commit_text(serial, description):
 			self._log(f"[{serial}] ⚠ ADB IME input failed, trying standard input text")
-			encoded_caption = self._encode_adb_text(caption)
+			encoded_caption = self._encode_adb_text(description)
 			safe_arg = shlex.quote(encoded_caption)
 			cmd = f"input text {safe_arg}"
 			try:
@@ -2282,8 +2658,8 @@ class ReelPoster:
 					if tap_center(self.adb, serial, describe_bounds):
 						time.sleep(0.6)
 						
-						if not self._adb_ime_commit_text(serial, caption):
-							encoded_caption = self._encode_adb_text(caption)
+						if not self._adb_ime_commit_text(serial, description):
+							encoded_caption = self._encode_adb_text(description)
 							safe_arg = shlex.quote(encoded_caption)
 							self.adb.shell(serial, f"input text {safe_arg}")
 						

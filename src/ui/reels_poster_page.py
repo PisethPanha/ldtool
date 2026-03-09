@@ -4,12 +4,13 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from typing import Any, Callable
 import time
 import uuid
 
 from PySide6.QtCore import Qt, QDateTime, QThread
+from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (
 	QWidget,
 	QVBoxLayout,
@@ -28,6 +29,14 @@ from PySide6.QtWidgets import (
 	QTableWidgetItem,
 	QPlainTextEdit,
 	QMessageBox,
+	QGroupBox,
+	QProgressBar,
+	QHeaderView,
+	QMenu,
+	QSplitter,
+	QFrame,
+	QCheckBox,
+	QComboBox,
 )
 
 from src.core.media_manager import (
@@ -37,21 +46,30 @@ from src.core.media_manager import (
 	scan_media,
 )
 from src.core.caption_mapper import CaptionMapper
+from src.core.ai_caption_service import AICaptionService
+from src.core.config import save_config
 from src.core.reel_jobs import ReelJob, ReelJobQueue
 from src.core.reel_poster import ReelPoster, ADBKeyboardRequest
 from src.core.task_runner import TaskRunner
+from src.core.process_queue_manager import ProcessQueueManager, ProcessSnapshot
 from src.ui.multi_reel_poster_worker import MultiReelPosterWorker
-from src.ui.process_queue_manager import ProcessQueueManager
+from src.ui.styles import STATUS_COLORS
+from src.ui.toast_widget import ToastWidget
+from src.ui.widgets import SectionTitle, icon_path
 
 
 class ReelsPosterPage(QWidget):
 	"""UI for building and running reel posting jobs."""
 
-	COL_MEDIA = 0
-	COL_INSTANCE = 1
-	COL_STATUS = 2
-	COL_ATTEMPTS = 3
-	COL_ERROR = 4
+	# Queue table column indices
+	COL_Q_INSTANCE = 0
+	COL_Q_PAGE = 1
+	COL_Q_MEDIA = 2
+	COL_Q_MODE = 3
+	COL_Q_SCHEDULE = 4
+	COL_Q_STATUS = 5
+	COL_Q_PROGRESS = 6
+	COL_Q_RESULT = 7
 
 	def __init__(
 		self,
@@ -71,7 +89,6 @@ class ReelsPosterPage(QWidget):
 		self._is_closing = False
 		self.stop_event: Event = Event()
 		self._media_paths: list[str] = []
-		self._job_row_map: dict[str, int] = {}
 		self._caption_mapper = CaptionMapper("./caption_mapping.json")
 
 		self.task_runner = TaskRunner()
@@ -83,17 +100,25 @@ class ReelsPosterPage(QWidget):
 		self._workers_by_pid: dict[str, MultiReelPosterWorker] = {}  # process_id -> worker
 		self._threads_by_pid: dict[str, QThread] = {}  # process_id -> thread
 		self._running_serials: set[str] = set()  # Track which instance serials are active
+		self._queue_progress_bars: dict[str, QProgressBar] = {}  # process_id -> progress bar
+		
+		# Process status tracking (since ProcessSnapshot doesn't have status)
+		self._process_status: dict[str, str] = {}  # process_id -> "queued" | "running" | "completed" | "failed"
 
-		# Process queue manager
-		self.queue_manager = ProcessQueueManager()
-		self.queue_manager.process_added.connect(self._on_queue_process_added)
-		self.queue_manager.status_changed.connect(self._on_queue_status_changed)
-		self.queue_manager.process_started.connect(self._on_queue_process_started)
-		self.queue_manager.process_completed.connect(self._on_queue_process_completed)
-		self.queue_manager.process_failed.connect(self._on_queue_process_failed)
-		self.queue_manager.log_message.connect(self._on_queue_log_message)
+		# Process queue manager (core business logic)
+		self.queue_manager = ProcessQueueManager(log_fn=self.log_fn)
+		self.log_fn("[INIT] ProcessQueueManager created")
+		
+		# Register callbacks (not Qt signals)
+		self.queue_manager.on_process_queued = self._on_queue_process_queued
+		self.queue_manager.on_process_started = self._on_queue_process_started
+		self.queue_manager.on_process_completed = self._on_queue_process_completed
+		self.queue_manager.on_process_failed = self._on_queue_process_failed
+		self.queue_manager.on_status_changed = self._on_queue_status_changed
+		self.log_fn("[INIT] ✓ All queue_manager callbacks registered")
 
 		self._build_ui()
+		self._load_ai_settings()
 
 	def _create_adbkeyboard_request(self, serial: str) -> ADBKeyboardRequest:
 		"""Create and emit an ADBKeyboard installation request.
@@ -129,44 +154,37 @@ class ReelsPosterPage(QWidget):
 
 	def _build_ui(self) -> None:
 		layout = QVBoxLayout(self)
+		layout.setSpacing(10)
+		layout.setContentsMargins(10, 10, 10, 10)
 
-		# Media folder picker
-		folder_row = QHBoxLayout()
-		folder_row.addWidget(QLabel("Media folder:"))
-		self.folder_input = QLineEdit()
-		self.browse_btn = QPushButton("Browse")
-		self.browse_btn.clicked.connect(self._pick_folder)
-		self.scan_btn = QPushButton("Scan")
-		self.scan_btn.clicked.connect(self._scan_media)
-		folder_row.addWidget(self.folder_input)
-		folder_row.addWidget(self.browse_btn)
-		folder_row.addWidget(self.scan_btn)
-		layout.addLayout(folder_row)
+		layout.addWidget(SectionTitle("Top Toolbar"))
 
-		# Media list + caption preview
-		media_row = QHBoxLayout()
-		self.media_list = QListWidget()
-		self.media_list.currentItemChanged.connect(self._update_caption_preview)
-		media_row.addWidget(self.media_list, 2)
+		top_controls = QGroupBox("Run Controls")
+		top_controls_layout = QVBoxLayout(top_controls)
+		top_controls_layout.setSpacing(8)
+		top_controls_layout.setContentsMargins(10, 10, 10, 10)
 
-		preview_col = QVBoxLayout()
-		preview_col.addWidget(QLabel("Caption preview:"))
-		self.caption_preview = QPlainTextEdit()
-		self.caption_preview.setReadOnly(True)
-		preview_col.addWidget(self.caption_preview)
-		media_row.addLayout(preview_col, 1)
-		layout.addLayout(media_row)
-
-		# Page loading row
+		# Page input on its own row
 		page_row = QHBoxLayout()
-		page_row.addWidget(QLabel("Target page:"))
+		page_row.setSpacing(8)
+		page_label = QLabel("Page")
+		page_label.setStyleSheet("padding: 10px; border-radius: 10px; background-color: #2a2c3e;")
+		page_row.addWidget(page_label)
 		self.page_input = QLineEdit()
-		self.page_input.setPlaceholderText("Enter Facebook page name")
+		self.page_input.setPlaceholderText("Select target page")
+		self.page_input.setMinimumWidth(220)
+		self.page_input.textChanged.connect(self._validate_start_button)
 		page_row.addWidget(self.page_input)
-		layout.addLayout(page_row)
+		page_row.addStretch()
+		top_controls_layout.addLayout(page_row)
 
-		# Mode / schedule / retry / concurrency
-		opts_row = QHBoxLayout()
+		# Other controls in second row
+		top_bar = QHBoxLayout()
+		top_bar.setSpacing(8)
+
+		mode_label = QLabel("Mode")
+		mode_label.setStyleSheet("padding: 10px; border-radius: 10px; background-color: #2a2c3e;")
+		top_bar.addWidget(mode_label)
 		self.post_now_radio = QRadioButton("Post now")
 		self.schedule_radio = QRadioButton("Schedule")
 		self.post_now_radio.setChecked(True)
@@ -174,74 +192,385 @@ class ReelsPosterPage(QWidget):
 		mode_group.addButton(self.post_now_radio)
 		mode_group.addButton(self.schedule_radio)
 		self.post_now_radio.toggled.connect(self._on_mode_changed)
-		opts_row.addWidget(self.post_now_radio)
-		opts_row.addWidget(self.schedule_radio)
+		top_bar.addWidget(self.post_now_radio)
+		top_bar.addWidget(self.schedule_radio)
 
 		self.schedule_dt = QDateTimeEdit(QDateTime.currentDateTime())
 		self.schedule_dt.setCalendarPopup(True)
 		self.schedule_dt.setEnabled(False)
-		opts_row.addWidget(self.schedule_dt)
+		self.schedule_dt.dateTimeChanged.connect(self._update_schedule_warning)
+		schedule_label = QLabel("Schedule")
+		schedule_label.setStyleSheet("padding: 10px; border-radius: 10px; background-color: #2a2c3e;")
+		top_bar.addWidget(schedule_label)
+		top_bar.addWidget(self.schedule_dt)
 
-		opts_row.addWidget(QLabel("Retry count:"))
+		retry_label = QLabel("Retry")
+		retry_label.setStyleSheet("padding: 10px; border-radius: 10px; background-color: #2a2c3e;")
+		top_bar.addWidget(retry_label)
 		self.retry_spin = QSpinBox()
 		self.retry_spin.setRange(1, 10)
 		self.retry_spin.setValue(2)
-		opts_row.addWidget(self.retry_spin)
+		top_bar.addWidget(self.retry_spin)
 
-		opts_row.addWidget(QLabel("Concurrency:"))
+		concurrency_label = QLabel("Concurrency")
+		concurrency_label.setStyleSheet("padding: 10px; border-radius: 10px; background-color: #2a2c3e;")
+		top_bar.addWidget(concurrency_label)
 		self.concurrent_spin = QSpinBox()
 		self.concurrent_spin.setRange(1, 32)
 		self.concurrent_spin.setValue(2)
-		opts_row.addWidget(self.concurrent_spin)
-		layout.addLayout(opts_row)
+		top_bar.addWidget(self.concurrent_spin)
 
-		# Actions
-		act_row = QHBoxLayout()
+		top_bar.addStretch()
+
 		self.start_btn = QPushButton("Start")
+		self.start_btn.setIcon(QIcon(icon_path("play.svg")))
 		self.start_btn.clicked.connect(self._start)
+
 		self.stop_btn = QPushButton("Stop")
+		self.stop_btn.setObjectName("dangerButton")
+		self.stop_btn.setIcon(QIcon(icon_path("stop.svg")))
 		self.stop_btn.clicked.connect(self._stop)
-		self.test_btn = QPushButton("Test")
-		self.test_btn.clicked.connect(self._test)
 		self.stop_btn.setEnabled(False)
-		act_row.addWidget(self.start_btn)
-		act_row.addWidget(self.stop_btn)
-		act_row.addWidget(self.test_btn)
-		layout.addLayout(act_row)
 
-		# Status table
-		self.table = QTableWidget(0, 5)
-		self.table.setHorizontalHeaderLabels(["Media", "Instance", "Status", "Attempts", "Error"])
-		self.table.horizontalHeader().setStretchLastSection(True)
-		layout.addWidget(self.table)
+		self.test_btn = QPushButton("Test")
+		self.test_btn.setObjectName("secondaryButton")
+		self.test_btn.clicked.connect(self._test)
 
-		# Process queue table
-		queue_label_row = QHBoxLayout()
-		queue_label_row.addWidget(QLabel("Process Queue:"))
-		self.clear_completed_btn = QPushButton("Clear Completed")
-		self.clear_completed_btn.clicked.connect(self._clear_completed_processes)
-		queue_label_row.addWidget(self.clear_completed_btn)
-		queue_label_row.addStretch()
-		layout.addLayout(queue_label_row)
+		top_bar.addWidget(self.start_btn)
+		top_bar.addWidget(self.stop_btn)
+		top_bar.addWidget(self.test_btn)
+
+		top_controls_layout.addLayout(top_bar)
+
+		self.schedule_warning = QLabel()
+		self.schedule_warning.setObjectName("subtleLabel")
+		self.schedule_warning.hide()
+		top_controls_layout.addWidget(self.schedule_warning)
+
+		layout.addWidget(top_controls)
+
+		# AI Captioning section
+		ai_controls = QGroupBox("AI Captioning")
+		ai_controls_layout = QVBoxLayout(ai_controls)
+		ai_controls_layout.setSpacing(8)
+		ai_controls_layout.setContentsMargins(10, 10, 10, 10)
+
+		# Row 0: Smart Title by Bot checkbox
+		ai_row0 = QHBoxLayout()
+		ai_row0.setSpacing(8)
+		self.smart_title_checkbox = QCheckBox("Smart Title by Bot")
+		self.smart_title_checkbox.setToolTip("Parse filename locally to extract title and hashtags")
+		self.smart_title_checkbox.stateChanged.connect(self._on_smart_title_changed)
+		ai_row0.addWidget(self.smart_title_checkbox)
+		ai_row0.addStretch()
+		ai_controls_layout.addLayout(ai_row0)
+
+		# Row 1: AI retitle checkbox and language selector
+		ai_row1 = QHBoxLayout()
+		ai_row1.setSpacing(8)
+		self.ai_retitle_checkbox = QCheckBox("Retitle by AI")
+		self.ai_retitle_checkbox.stateChanged.connect(self._on_ai_enabled_changed)
+		ai_row1.addWidget(self.ai_retitle_checkbox)
 		
-		self.queue_table = QTableWidget(0, 6)
-		self.queue_table.setHorizontalHeaderLabels(["Instance", "Page", "Media Count", "Mode", "Schedule Time", "Status"])
-		self.queue_table.horizontalHeader().setStretchLastSection(True)
-		layout.addWidget(self.queue_table)
+		ai_lang_label = QLabel("Language:")
+		ai_lang_label.setStyleSheet("padding: 10px; border-radius: 10px; background-color: #2a2c3e;")
+		ai_row1.addWidget(ai_lang_label)
+		self.ai_language_combo = QComboBox()
+		self.ai_language_combo.setFixedHeight(30)
+		self.ai_language_combo.addItems([
+			"English",
+			"Khmer",
+			"French",
+			"Spanish",
+			"German",
+			"Chinese",
+			"Japanese",
+			"Korean",
+			"Thai",
+			"Vietnamese",
+		])
+		self.ai_language_combo.setEnabled(False)
+		self.ai_language_combo.currentTextChanged.connect(lambda: self._save_ai_settings())
+		ai_row1.addWidget(self.ai_language_combo)
+		ai_row1.addStretch()
+		ai_controls_layout.addLayout(ai_row1)
 
-		# Per instance log panel
-		layout.addWidget(QLabel("Per-instance log"))
-		self.instance_log = QPlainTextEdit()
-		self.instance_log.setReadOnly(True)
-		layout.addWidget(self.instance_log)
+		# Row 2: Gemini API key input and test button
+		ai_row2 = QHBoxLayout()
+		ai_row2.setSpacing(8)
+		api_key_label = QLabel("Gemini API Key:")
+		api_key_label.setStyleSheet("padding: 10px; border-radius: 10px; background-color: #2a2c3e;")
+		ai_row2.addWidget(api_key_label)
+		self.gemini_api_key_edit = QLineEdit()
+		self.gemini_api_key_edit.setFixedHeight(30)
+		self.gemini_api_key_edit.setEchoMode(QLineEdit.Password)
+		self.gemini_api_key_edit.setPlaceholderText("Paste Gemini API key here")
+		self.gemini_api_key_edit.setEnabled(False)
+		self.gemini_api_key_edit.textChanged.connect(self._on_api_key_changed)
+		ai_row2.addWidget(self.gemini_api_key_edit, 1)
+		
+		self.gemini_test_button = QPushButton("Test API")
+		self.gemini_test_button.setFixedHeight(30)
+		self.gemini_test_button.setFixedWidth(80)
+		self.gemini_test_button.setEnabled(False)
+		self.gemini_test_button.clicked.connect(self._test_gemini_api)
+		ai_row2.addWidget(self.gemini_test_button)
+		ai_controls_layout.addLayout(ai_row2)
+
+		layout.addWidget(ai_controls)
+
+		# Subfolder navigation controls
+		subfolder_controls = QGroupBox("Subfolder Navigation")
+		subfolder_layout = QHBoxLayout(subfolder_controls)
+		subfolder_layout.setSpacing(8)
+		subfolder_layout.setContentsMargins(10, 10, 10, 10)
+
+		self.use_subfolder_checkbox = QCheckBox("Have sub folder?")
+		self.use_subfolder_checkbox.setToolTip("Navigate into a subfolder inside Pictures before selecting media")
+		self.use_subfolder_checkbox.stateChanged.connect(self._on_subfolder_toggled)
+		subfolder_layout.addWidget(self.use_subfolder_checkbox)
+
+		subfolder_name_label = QLabel("Sub folder name:")
+		subfolder_name_label.setStyleSheet("padding: 10px; border-radius: 10px; background-color: #2a2c3e;")
+		subfolder_layout.addWidget(subfolder_name_label)
+		self.subfolder_name_input = QLineEdit()
+		self.subfolder_name_input.setPlaceholderText("e.g. MindReg")
+		self.subfolder_name_input.setEnabled(False)
+		self.subfolder_name_input.setMinimumWidth(180)
+		subfolder_layout.addWidget(self.subfolder_name_input)
+		subfolder_layout.addStretch()
+
+		layout.addWidget(subfolder_controls)
+
+		splitter = QSplitter(Qt.Horizontal)
+
+		left_widget = QWidget()
+		left_col = QVBoxLayout(left_widget)
+		left_col.setContentsMargins(0, 0, 0, 0)
+		left_col.setSpacing(10)
+
+		left_col.addWidget(SectionTitle("Media Selection"))
+		media_group = QGroupBox("Media Panel")
+		media_layout = QVBoxLayout(media_group)
+		media_layout.setSpacing(10)
+		media_layout.setContentsMargins(10, 10, 10, 10)
+
+		folder_row = QHBoxLayout()
+		folder_row.setSpacing(8)
+		self.folder_input = QLineEdit()
+		self.folder_input.setPlaceholderText("Choose folder containing reels")
+
+		self.browse_btn = QPushButton("Browse")
+		self.browse_btn.setObjectName("iconButton")
+		self.browse_btn.setIcon(QIcon(icon_path("folder.svg")))
+		self.browse_btn.clicked.connect(self._pick_folder)
+
+		self.scan_btn = QPushButton("Scan")
+		self.scan_btn.setObjectName("iconButton")
+		self.scan_btn.setIcon(QIcon(icon_path("scan.svg")))
+		self.scan_btn.clicked.connect(self._scan_media)
+
+		folder_row.addWidget(self.folder_input)
+		folder_row.addWidget(self.browse_btn)
+		folder_row.addWidget(self.scan_btn)
+		media_layout.addLayout(folder_row)
+
+		sel_row = QHBoxLayout()
+		sel_row.setSpacing(8)
+		sel_all_btn = QPushButton("All")
+		sel_all_btn.setObjectName("secondaryButton")
+		sel_all_btn.clicked.connect(self._select_all_media)
+		unsel_btn = QPushButton("None")
+		unsel_btn.setObjectName("secondaryButton")
+		unsel_btn.clicked.connect(self._unselect_all_media)
+		invert_btn = QPushButton("Invert")
+		invert_btn.setObjectName("secondaryButton")
+		invert_btn.clicked.connect(self._invert_media_selection)
+		self.media_counter_label = QLabel("0 / 0")
+		self.media_counter_label.setObjectName("subtleLabel")
+		sel_row.addWidget(sel_all_btn)
+		sel_row.addWidget(unsel_btn)
+		sel_row.addWidget(invert_btn)
+		sel_row.addStretch()
+		sel_row.addWidget(self.media_counter_label)
+		media_layout.addLayout(sel_row)
+
+		self.media_list = QListWidget()
+		self.media_list.itemClicked.connect(lambda _: self._update_media_counter())
+		media_layout.addWidget(self.media_list, 1)
+
+		self.media_empty_label = QLabel("No media loaded\nBrowse a folder to begin")
+		self.media_empty_label.setObjectName("emptyStateLabel")
+		self.media_empty_label.setAlignment(Qt.AlignCenter)
+		media_layout.addWidget(self.media_empty_label)
+
+		left_col.addWidget(media_group, 4)
+
+		splitter.addWidget(left_widget)
+
+		right_widget = QWidget()
+		right_col = QVBoxLayout(right_widget)
+		right_col.setContentsMargins(0, 0, 0, 0)
+		right_col.setSpacing(10)
+
+		right_col.addWidget(SectionTitle("Process Queue"))
+		queue_group = QGroupBox("Queue Dashboard")
+		queue_layout = QVBoxLayout(queue_group)
+		queue_layout.setSpacing(8)
+		queue_layout.setContentsMargins(10, 10, 10, 10)
+
+		queue_toolbar = QHBoxLayout()
+		queue_toolbar.addStretch()
+		self.clear_completed_btn = QPushButton("Clear Completed")
+		self.clear_completed_btn.setObjectName("secondaryButton")
+		self.clear_completed_btn.setIcon(QIcon(icon_path("trash.svg")))
+		self.clear_completed_btn.clicked.connect(self._clear_completed_processes)
+		queue_toolbar.addWidget(self.clear_completed_btn)
+		queue_layout.addLayout(queue_toolbar)
+
+		self.queue_table = QTableWidget(0, 8)
+		self.queue_table.setHorizontalHeaderLabels([
+			"Instance", "Page", "Media", "Mode",
+			"Schedule", "Status", "Progress", "Result",
+		])
+		header = self.queue_table.horizontalHeader()
+		header.setStretchLastSection(True)
+		header.setSectionResizeMode(self.COL_Q_STATUS, QHeaderView.ResizeMode.ResizeToContents)
+		header.setSectionResizeMode(self.COL_Q_PROGRESS, QHeaderView.ResizeMode.Stretch)
+		self.queue_table.setAlternatingRowColors(True)
+		self.queue_table.verticalHeader().setDefaultSectionSize(24)
+		self.queue_table.setContextMenuPolicy(Qt.CustomContextMenu)
+		self.queue_table.customContextMenuRequested.connect(self._on_queue_context_menu)
+		queue_layout.addWidget(self.queue_table, 1)
+
+		self.queue_empty_label = QLabel("No processes in queue\nCreate a process to get started")
+		self.queue_empty_label.setObjectName("emptyStateLabel")
+		self.queue_empty_label.setAlignment(Qt.AlignCenter)
+		queue_layout.addWidget(self.queue_empty_label)
+
+		right_col.addWidget(queue_group, 1)
+
+		splitter.addWidget(right_widget)
+		splitter.setSizes([520, 580])
+		layout.addWidget(splitter, 1)
+
+		self._toast = ToastWidget(self)
+
+		self._validate_start_button()
+		self._update_empty_states()
+
+	def _load_ai_settings(self) -> None:
+		"""Load AI settings from config and update UI."""
+		try:
+			config = self.get_config_fn()
+			use_smart_title = config.get("use_smart_title", "false").lower() == "true"
+			use_ai = config.get("use_ai_retitle", "false").lower() == "true"
+			api_key = config.get("gemini_api_key", "")
+			language = config.get("ai_target_language", "English")
+			
+			# Debug logging
+			has_key = bool(api_key and api_key.strip())
+			self.log_fn(f"Loading AI settings from config:")
+			self.log_fn(f"  - use_smart_title: {use_smart_title}")
+			self.log_fn(f"  - use_ai_retitle: {use_ai}")
+			self.log_fn(f"  - gemini_api_key present: {'yes' if has_key else 'no'}")
+			self.log_fn(f"  - ai_target_language: {language}")
+			
+			self.smart_title_checkbox.setChecked(use_smart_title)
+			self.ai_retitle_checkbox.setChecked(use_ai)
+			self.gemini_api_key_edit.setText(api_key)
+			
+			idx = self.ai_language_combo.findText(language)
+			if idx >= 0:
+				self.ai_language_combo.setCurrentIndex(idx)
+		except Exception as e:
+			self.log_fn(f"Error loading AI settings: {e}")
+
+	def _save_ai_settings(self) -> None:
+		"""Save AI settings to config."""
+		try:
+			config = self.get_config_fn()
+			config["use_smart_title"] = "true" if self.smart_title_checkbox.isChecked() else "false"
+			config["use_ai_retitle"] = "true" if self.ai_retitle_checkbox.isChecked() else "false"
+			config["gemini_api_key"] = self.gemini_api_key_edit.text()
+			config["ai_target_language"] = self.ai_language_combo.currentText()
+			save_config(config)
+			
+			# Debug logging
+			has_key = bool(config["gemini_api_key"].strip())
+			self.log_fn(f"AI settings saved to config:")
+			self.log_fn(f"  - use_smart_title: {config['use_smart_title']}")
+			self.log_fn(f"  - use_ai_retitle: {config['use_ai_retitle']}")
+			self.log_fn(f"  - gemini_api_key present: {'yes' if has_key else 'no'}")
+			self.log_fn(f"  - ai_target_language: {config['ai_target_language']}")
+		except Exception as e:
+			self.log_fn(f"Error saving AI settings: {e}")
+
+	def _on_smart_title_changed(self, state: int) -> None:
+		"""Handle Smart Title checkbox state change - mutually exclusive with AI."""
+		if self.smart_title_checkbox.isChecked():
+			# Uncheck AI Retitle if Smart Title is checked
+			self.ai_retitle_checkbox.setChecked(False)
+		self._save_ai_settings()
+
+	def _on_ai_enabled_changed(self, state: int) -> None:
+		"""Handle AI retitle checkbox state change - mutually exclusive with Smart Title."""
+		checked = self.ai_retitle_checkbox.isChecked()
+		if checked:
+			# Uncheck Smart Title if AI Retitle is checked
+			self.smart_title_checkbox.setChecked(False)
+		self.ai_language_combo.setEnabled(checked)
+		self.gemini_api_key_edit.setEnabled(checked)
+		self.gemini_test_button.setEnabled(checked and len(self.gemini_api_key_edit.text()) > 0)
+		self._save_ai_settings()
+
+	def _on_api_key_changed(self, text: str) -> None:
+		"""Handle API key text changes - enable/disable test button."""
+		has_key = len(text.strip()) > 0
+		is_enabled = self.ai_retitle_checkbox.isChecked()
+		self.gemini_test_button.setEnabled(is_enabled and has_key)
+		self._save_ai_settings()
+
+	def _test_gemini_api(self) -> None:
+		"""Test Gemini API connection in a worker thread."""
+		api_key = self.gemini_api_key_edit.text().strip()
+		if not api_key:
+			self._toast.show_error("Please enter a Gemini API key")
+			return
+		
+		self.gemini_test_button.setEnabled(False)
+		self.gemini_test_button.setText("Testing...")
+		
+		def test_worker():
+			try:
+				service = AICaptionService(api_key, self.log_fn)
+				success, error = service.test_connection()
+				
+				# Update UI in main thread using Qt signals
+				if not self._is_closing:
+					self.gemini_test_button.setText("Test API")
+					self.gemini_test_button.setEnabled(True)
+					
+					if success:
+						self._toast.show_success("Gemini API is working!")
+						self.log_fn("✓ Gemini API connection test PASSED")
+					else:
+						self._toast.show_error(f"API test failed: {error}")
+						self.log_fn(f"✗ Gemini API connection test FAILED: {error}")
+			except Exception as e:
+				if not self._is_closing:
+					self.gemini_test_button.setText("Test API")
+					self.gemini_test_button.setEnabled(True)
+					self._toast.show_error(f"Test error: {str(e)}")
+					self.log_fn(f"✗ Gemini API test exception: {str(e)}")
+		
+		# Run test in background thread
+		thread = Thread(target=test_worker, daemon=True)
+		thread.start()
 
 	def closeEvent(self, event) -> None:  # type: ignore[override]
 		self._is_closing = True
 		self.stop_event.set()
-		
-		# Stop queue manager timer
-		if hasattr(self, 'queue_manager'):
-			self.queue_manager.scheduler_timer.stop()
 		
 		# Clean up all active workers and threads
 		for process_id, worker in list(self._workers_by_pid.items()):
@@ -286,17 +615,167 @@ class ReelsPosterPage(QWidget):
 		
 		self._caption_mapper.add_batch(batch_entries)
 		self._log(f"Loaded {len(self._media_paths)} media file(s) with caption mappings.")
-
-	def _update_caption_preview(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
-		del previous
-		if current is None:
-			self.caption_preview.setPlainText("")
-			return
-		path = current.data(Qt.UserRole)
-		self.caption_preview.setPlainText(caption_from_filename(path))
+		self._update_media_counter()
 
 	def _on_mode_changed(self) -> None:
 		self.schedule_dt.setEnabled(self.schedule_radio.isChecked())
+		self._update_schedule_warning()
+
+	# ------------------------------------------------------------------
+	# Media selection helpers
+	# ------------------------------------------------------------------
+	def _select_all_media(self) -> None:
+		for i in range(self.media_list.count()):
+			self.media_list.item(i).setCheckState(Qt.Checked)
+		self._update_media_counter()
+
+	def _unselect_all_media(self) -> None:
+		for i in range(self.media_list.count()):
+			self.media_list.item(i).setCheckState(Qt.Unchecked)
+		self._update_media_counter()
+
+	def _invert_media_selection(self) -> None:
+		for i in range(self.media_list.count()):
+			item = self.media_list.item(i)
+			item.setCheckState(Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked)
+		self._update_media_counter()
+
+	def _update_media_counter(self) -> None:
+		total = self.media_list.count()
+		selected = sum(
+			1 for i in range(total) if self.media_list.item(i).checkState() == Qt.Checked
+		)
+		self.media_counter_label.setText(f"{selected} / {total}")
+		self._validate_start_button()
+		self._update_empty_states()
+
+	def _on_subfolder_toggled(self, state: int) -> None:
+		"""Enable/disable subfolder name input based on checkbox."""
+		enabled = state == Qt.Checked.value
+		self.subfolder_name_input.setEnabled(enabled)
+		if not enabled:
+			self.subfolder_name_input.clear()
+
+	def _validate_start_button(self) -> None:
+		"""Enable/disable Start based on required fields; set tooltip."""
+		reasons: list[str] = []
+		has_media = any(
+			self.media_list.item(i).checkState() == Qt.Checked
+			for i in range(self.media_list.count())
+		)
+		if not has_media:
+			reasons.append("Select at least one media file")
+		if not self.page_input.text().strip():
+			reasons.append("Enter a target page name")
+
+		enabled = not reasons
+		self.start_btn.setEnabled(enabled)
+		self.test_btn.setEnabled(enabled)
+		tooltip = "\n".join(reasons) if reasons else ""
+		self.start_btn.setToolTip(tooltip)
+		self.test_btn.setToolTip(tooltip)
+
+	def _update_schedule_warning(self) -> None:
+		if not self.schedule_radio.isChecked():
+			self.schedule_warning.hide()
+			return
+		scheduled = self.schedule_dt.dateTime().toPython()
+		now = datetime.now()
+		if scheduled < now:
+			self.schedule_warning.setText("\u26A0 Scheduled time is in the past.")
+			self.schedule_warning.show()
+		elif (scheduled - now).total_seconds() < 25 * 60:
+			self.schedule_warning.setText(
+				"\u26A0 Scheduled time is less than 25 minutes from now."
+			)
+			self.schedule_warning.show()
+		else:
+			self.schedule_warning.hide()
+
+	def _update_empty_states(self) -> None:
+		self.media_empty_label.setVisible(self.media_list.count() == 0)
+		self.queue_empty_label.setVisible(self.queue_table.rowCount() == 0)
+
+	def _resolve_selected_serials(self) -> None:
+		"""Freshly resolve ADB serials for all selected instances."""
+		from src.core.adb_manager import ADBManager
+		from src.core.ldplayer_controller import LDPlayerController
+
+		cfg = self.get_config_fn()
+		ctrl = LDPlayerController(cfg.get("dnconsole_path", ""), self._log)
+		adb = ADBManager(cfg.get("adb_path", ""), self._log)
+
+		# Re-scan instances to get current running state
+		instances = ctrl.list_instances()
+		# Build a quick index->running lookup
+		running_map = {int(i["index"]): i for i in instances if i.get("is_running")}
+
+		state = self.get_state_fn()
+		for inst in state.get_selected_instances():
+			expected = adb.serial_for_index(inst.index)
+			devices = set(adb.list_devices())
+			if expected in devices:
+				if inst.adb_serial != expected:
+					self._log(f"Resolved instance {inst.index} ({inst.name}) → {expected}")
+				inst.adb_serial = expected
+			elif inst.index in running_map:
+				# Running but no serial — clear stale serial
+				self._log(
+					f"Instance {inst.index} ({inst.name}) is running but "
+					f"{expected} not in ADB devices. Serial cleared."
+				)
+				inst.adb_serial = None
+			else:
+				# Not running — clear serial
+				if inst.adb_serial:
+					self._log(f"Instance {inst.index} ({inst.name}) is not running. Serial cleared.")
+				inst.adb_serial = None
+
+	# ------------------------------------------------------------------
+	# Queue context menu (right-click actions)
+	# ------------------------------------------------------------------
+	def _on_queue_context_menu(self, pos) -> None:
+		row = self.queue_table.rowAt(pos.y())
+		if row < 0:
+			return
+		item = self.queue_table.item(row, self.COL_Q_INSTANCE)
+		if not item:
+			return
+		process_id = item.data(Qt.UserRole)
+		process = self.queue_manager.get_process(process_id)
+		if not process:
+			return
+
+		menu = QMenu(self)
+		if process.status == "Waiting":
+			act = menu.addAction("Cancel")
+			act.triggered.connect(lambda: self.queue_manager.cancel_process(process_id))
+		if process.status == "Running":
+			act = menu.addAction("Cancel Running")
+			act.triggered.connect(lambda: self._cancel_running_process(process_id))
+		if process.status in ("Completed", "Failed"):
+			act = menu.addAction("Remove")
+			act.triggered.connect(lambda: self._remove_queue_row(row, process_id))
+		if menu.actions():
+			menu.exec(self.queue_table.viewport().mapToGlobal(pos))
+
+	def _cancel_running_process(self, process_id: str) -> None:
+		reply = QMessageBox.question(
+			self, "Cancel Process",
+			"Cancel this running process?",
+			QMessageBox.Yes | QMessageBox.No,
+			QMessageBox.No,
+		)
+		if reply != QMessageBox.Yes:
+			return
+		worker = self._workers_by_pid.get(process_id)
+		if worker:
+			worker.cancel()
+
+	def _remove_queue_row(self, row: int, process_id: str) -> None:
+		self._queue_progress_bars.pop(process_id, None)
+		self.queue_table.removeRow(row)
+		self._update_empty_states()
 
 	def _show_reject_dialog(self, reason: str) -> None:
 		"""Show a robust rejection dialog and fall back to log if UI dialog fails."""
@@ -313,74 +792,189 @@ class ReelsPosterPage(QWidget):
 			self._log(f"Reject reason: {message}")
 
 	def _start(self) -> None:
+		"""Start posting process with queue manager."""
+		self._log("[START] ==================================================")
+		self._log("[START] _start() method called")
+		self._log(f"[START] Queue manager exists: {self.queue_manager is not None}")
+		if self.queue_manager:
+			self._log(f"[START] Queue manager callbacks:")
+			self._log(f"[START]   - on_process_queued: {self.queue_manager.on_process_queued is not None}")
+			self._log(f"[START]   - on_process_started: {self.queue_manager.on_process_started is not None}")
+			self._log(f"[START]   - on_process_completed: {self.queue_manager.on_process_completed is not None}")
+			self._log(f"[START]   - on_process_failed: {self.queue_manager.on_process_failed is not None}")
+			self._log(f"[START]   - on_status_changed: {self.queue_manager.on_status_changed is not None}")
+		
+		# Validate AI settings if enabled
+		if self.ai_retitle_checkbox.isChecked():
+			api_key = self.gemini_api_key_edit.text().strip()
+			if not api_key:
+				self._toast.show_error("AI retitle enabled but no API key provided")
+				self.log_fn("✗ Cannot start: AI enabled but Gemini API key is missing")
+				return
+			
+			# Test if Gemini service can be initialized
+			self.log_fn("Validating Gemini API configuration...")
+			test_service = AICaptionService(api_key, self.log_fn)
+			is_ready, init_error = test_service.is_ready()
+			
+			if not is_ready:
+				self._toast.show_error(f"Gemini initialization failed: {init_error}")
+				self.log_fn(f"✗ Cannot start: Gemini init failed - {init_error}")
+				self.log_fn("   You can either:")
+				self.log_fn("   1. Fix the API key and try again")
+				self.log_fn("   2. Uncheck 'Retitle by AI' to proceed without AI")
+				return
+			else:
+				self.log_fn("✓ Gemini API configuration validated successfully")
+		
+		# Validate subfolder if enabled
+		if self.use_subfolder_checkbox.isChecked():
+			subfolder = self.subfolder_name_input.text().strip()
+			if not subfolder:
+				self._toast.show_error("Please enter a sub folder name.")
+				self.log_fn("✗ Cannot start: Subfolder enabled but no folder name provided")
+				return
+
 		payload = self._build_run_payload(test_mode=False)
 		if payload is None:
+			self._log("[START] ✗ _build_run_payload returned None, aborting")
 			return
 		
 		# Use queue manager for multi-media posts
 		jobs = payload["jobs"]
 		instances = payload["instances"]
 		
-		if len(jobs) > 1:
-			# Multi-media: add to queue with validation
-			selected_instance = instances[0]
-			instance_serial = getattr(selected_instance, "adb_serial", "")
-			instance_name = getattr(selected_instance, "name", instance_serial or "Unknown")
-			post_mode = jobs[0].post_mode if jobs else "NOW"
-			scheduled_at = jobs[0].scheduled_at if jobs else None
-			
-			# Validate against queue rules
-			try:
-				is_valid, error_msg = self.queue_manager.validate_new_process(
-					instance_serial,
-					instance_name,
-					instances,
-					post_mode,
-					scheduled_at,
-				)
-			except Exception as exc:
-				self._show_reject_dialog(f"Validation failed: {exc}")
-				return
-			if not is_valid:
-				self._show_reject_dialog(error_msg)
-				return
-			
-			# Add to queue
-			page_name = jobs[0].target_page if jobs else ""
-			self.queue_manager.add_process(
-				selected_instance,
-				instance_serial,
-				instance_name,
-				page_name,
-				jobs,
-				post_mode,
-				scheduled_at,
-			)
-			
-			# Clear inputs (Rule 1)
-			self._clear_inputs()
-			
-			self._log(f"Process added to queue: {len(jobs)} media for {len(instances)} instance(s)")
+		self._log(f"[START] ===== _start() called =====")
+		self._log(f"[START] Number of jobs: {len(jobs)}, Number of instances: {len(instances)}")
+		self._log(f"[START] Payload keys: {list(payload.keys())}")
+		
+		if not jobs or not instances:
+			self._log(f"[START] ✗ Invalid payload: jobs={len(jobs)}, instances={len(instances)}")
+			return
+		
+		# ALL posts go through queue manager (single OR multi-media)
+		self._log(f"[START] ✓ Queueing process ({len(jobs)} job(s))")
+		
+		# Create process snapshot and add to queue
+		selected_instance = instances[0]
+		instance_serial = getattr(selected_instance, "adb_serial", "")
+		instance_name = getattr(selected_instance, "name", instance_serial or "Unknown")
+		post_mode = jobs[0].post_mode if jobs else "NOW"
+		scheduled_at = jobs[0].scheduled_at if jobs else None
+		page_name = jobs[0].target_page if jobs else ""
+		
+		self._log(f"[START] Process details:")
+		self._log(f"        instance_name='{instance_name}'")
+		self._log(f"        instance_serial='{instance_serial}'")
+		self._log(f"        selected_instance.name='{getattr(selected_instance, 'name', 'N/A')}'")
+		self._log(f"        Jobs: {len(jobs)}, Mode: {post_mode}")
+		
+		# Check if instance is already busy
+		is_busy = self.queue_manager.is_instance_busy(instance_name)
+		self._log(f"[START] Instance '{instance_name}' busy check: {is_busy}")
+		if is_busy:
+			self._log(f"[START] Instance is locked, process will queue")
 		else:
-			# Single media: use existing direct flow
-			self._start_worker(payload)
+			self._log(f"[START] Instance is free, process will start immediately")
+		
+		# Create immutable process snapshot
+		process = ProcessSnapshot(
+			process_id=str(uuid.uuid4()),
+			instance_name=instance_name,
+			instance_serial=instance_serial,
+			page_name=page_name,
+			jobs=jobs,
+			post_mode=post_mode,
+			scheduled_at=scheduled_at,
+			have_subfolder=self.use_subfolder_checkbox.isChecked(),
+			subfolder_name=self.subfolder_name_input.text().strip()
+		)
+		
+		self._log(f"[START] ProcessSnapshot created with ID: {process.process_id[:8]}")
+		
+		# Register this process in status tracking
+		self._process_status[process.process_id] = "queued"
+		
+		# Add to queue manager
+		self._log(f"[START] Calling queue_manager.enqueue()")
+		self.queue_manager.enqueue(process)
+		
+		# Log summary
+		mode_str = "Immediate"
+		if post_mode == "SCHEDULED" and scheduled_at:
+			mode_str = f"Scheduled ({scheduled_at.strftime('%H:%M')})"
+		
+		self._log(f"[START] Process {process.process_id[:8]} queued: {len(jobs)} {'media' if len(jobs) > 1 else 'file'} for {instance_name}, mode={mode_str}")
+		
+		# Clear inputs AFTER snapshot is created
+		self._clear_inputs()
+		
+		# Toast feedback
+		self._toast.show_message(
+			f"\u2713 Process added to queue\n"
+			f"Instance: {instance_name}\n"
+			f"Media: {len(jobs)} {'files' if len(jobs) > 1 else 'file'}  \u2022  Mode: {mode_str}"
+			)
 
 	def _test(self) -> None:
+		# Validate AI settings if enabled
+		if self.ai_retitle_checkbox.isChecked():
+			api_key = self.gemini_api_key_edit.text().strip()
+			if not api_key:
+				self._toast.show_error("AI retitle enabled but no API key provided")
+				self.log_fn("✗ Cannot test: AI enabled but Gemini API key is missing")
+				return
+			
+			# Test if Gemini service can be initialized
+			self.log_fn("Validating Gemini API configuration...")
+			test_service = AICaptionService(api_key, self.log_fn)
+			is_ready, init_error = test_service.is_ready()
+			
+			if not is_ready:
+				self._toast.show_error(f"Gemini initialization failed: {init_error}")
+				self.log_fn(f"✗ Cannot test: Gemini init failed - {init_error}")
+				self.log_fn("   You can either:")
+				self.log_fn("   1. Fix the API key and try again")
+				self.log_fn("   2. Uncheck 'Retitle by AI' to proceed without AI")
+				return
+			else:
+				self.log_fn("✓ Gemini API configuration validated successfully")
+		
 		payload = self._build_run_payload(test_mode=True)
 		if payload is None:
 			return
 		self._start_worker(payload)
 
 	def _stop(self) -> None:
+		"""Stop all running processes."""
+		self._log("[STOP] ===== _stop() called =====")
+		# Confirmation dialog
+		active = len(self._workers_by_pid)
+		self._log(f"[STOP] Active workers: {active}")
+		self._log(f"[STOP] Active worker IDs: {list(self._workers_by_pid.keys())}")
+		if active > 0:
+			reply = QMessageBox.question(
+				self, "Confirm Stop",
+				f"Cancel {active} running process(es)?",
+				QMessageBox.Yes | QMessageBox.No,
+				QMessageBox.No,
+			)
+			if reply != QMessageBox.Yes:
+				self._log("[STOP] User declined to stop processes")
+				return
+			self._log("[STOP] User confirmed stop")
+
 		# Stop all active multi-media workers
+		self._log("[STOP] Cancelling all active workers...")
 		for process_id, worker in self._workers_by_pid.items():
 			if worker is not None:
+				self._log(f"[STOP] Cancelling worker for process {process_id[:8]}")
 				worker.cancel()
 		
 		# Stop the parallel worker (if any)
 		self.stop_event.set()
 		self.stop_btn.setEnabled(False)
-		self._log("Stop requested.")
+		self._log("[STOP] Stop requested - all workers cancelled.")
 
 	def _start_worker(self, payload: dict[str, Any]) -> None:
 		"""Start a direct (non-queued) worker for single-media posting."""
@@ -396,19 +990,6 @@ class ReelsPosterPage(QWidget):
 		self.start_btn.setEnabled(False)
 		self.test_btn.setEnabled(False)
 		self.stop_btn.setEnabled(True)
-		self.instance_log.clear()
-
-		# Prepare table rows for jobs (main thread)
-		self._job_row_map.clear()
-		self.table.setRowCount(0)
-		for row_idx, job in enumerate(payload["jobs"]):
-			self.table.insertRow(row_idx)
-			self.table.setItem(row_idx, self.COL_MEDIA, QTableWidgetItem(Path(job.media_path).name))
-			self.table.setItem(row_idx, self.COL_INSTANCE, QTableWidgetItem(""))
-			self.table.setItem(row_idx, self.COL_STATUS, QTableWidgetItem("QUEUED"))
-			self.table.setItem(row_idx, self.COL_ATTEMPTS, QTableWidgetItem("0"))
-			self.table.setItem(row_idx, self.COL_ERROR, QTableWidgetItem(""))
-			self._job_row_map[job.id] = row_idx
 
 		# Single media: use existing parallel flow
 		self.task_runner.run(self._do_run_jobs, payload)
@@ -419,6 +1000,21 @@ class ReelsPosterPage(QWidget):
 		Each process gets its own worker and thread, enabling parallel execution
 		for different instances.
 		"""
+		self._log(f"[WORKER-START] ===== _start_multi_media_worker =====")
+		self._log(f"[WORKER-START] Process ID: {process_id[:8]}")
+		self._log(f"[WORKER-START] Instance serial: {instance_serial}")
+		self._log(f"[WORKER-START] Jobs count: {len(jobs)}")
+		self._log(f"[WORKER-START] Current workers: {list(self._workers_by_pid.keys())}")
+		self._log(f"[WORKER-START] Current threads: {list(self._threads_by_pid.keys())}")
+		self._log(f"[WORKER-START] Running serials: {self._running_serials}")
+		
+		# Check if worker already exists for this process
+		if process_id in self._workers_by_pid:
+			self._log(f"[WORKER-START] ✗ WARNING: Worker already exists for process {process_id[:8]}! Replacing...")
+			old_worker = self._workers_by_pid[process_id]
+			if old_worker:
+				old_worker.cancel()
+		
 		# Create worker with process tracking
 		worker = MultiReelPosterWorker(
 			process_id=process_id,
@@ -428,17 +1024,24 @@ class ReelsPosterPage(QWidget):
 			adb_manager=self.get_adb_manager_fn(),
 			get_adbkeyboard_request_fn=self._create_adbkeyboard_request,
 			log_fn=self.log_fn,
+			get_config_fn=self.get_config_fn,
 		)
+		self._log(f"[WORKER-START] ✓ Worker object created")
 		
 		# Create thread
 		thread = QThread()
 		worker.moveToThread(thread)
+		self._log(f"[WORKER-START] ✓ Worker moved to thread")
 		
 		# Connect signals (include process_id in finished signal)
 		thread.started.connect(worker.run)
 		worker.log_message.connect(self._on_multi_worker_log)
-		worker.progress.connect(self._on_multi_worker_progress)
+		pid = process_id  # capture for lambda
+		worker.progress.connect(
+			lambda idx, total, name, status, p=pid: self._on_multi_worker_progress(idx, total, name, status, p)
+		)
 		worker.finished.connect(self._on_multi_worker_finished)
+		self._log(f"[WORKER-START] ✓ Signals connected")
 		
 		# Auto-cleanup: when thread finishes, delete worker and thread
 		thread.finished.connect(worker.deleteLater)
@@ -448,27 +1051,31 @@ class ReelsPosterPage(QWidget):
 		self._workers_by_pid[process_id] = worker
 		self._threads_by_pid[process_id] = thread
 		self._running_serials.add(instance_serial)
+		self._log(f"[WORKER-START] ✓ Worker stored in _workers_by_pid[{process_id[:8]}]")
+		self._log(f"[WORKER-START] ✓ Thread stored in _threads_by_pid[{process_id[:8]}]")
+		self._log(f"[WORKER-START] Total active workers: {len(self._workers_by_pid)}")
 		
 		# Start thread
 		thread.start()
+		self._log(f"[WORKER-START] ✓ Thread started for process {process_id[:8]}")
 	
 	def _on_multi_worker_log(self, message: str) -> None:
 		"""Handle log message from multi-media worker."""
 		if self._is_closing:
 			return
 		self._log(message)
-		self.instance_log.appendPlainText(message)
 	
-	def _on_multi_worker_progress(self, idx: int, total: int, media_name: str, status: str) -> None:
+	def _on_multi_worker_progress(self, idx: int, total: int, media_name: str, status: str, process_id: str = "") -> None:
 		"""Handle progress update from multi-media worker."""
 		if self._is_closing:
 			return
-		# Update table row for this media
-		for row_idx in range(self.table.rowCount()):
-			item = self.table.item(row_idx, self.COL_MEDIA)
-			if item and item.text() == media_name:
-				self.table.setItem(row_idx, self.COL_STATUS, QTableWidgetItem(status))
-				break
+		# Update queue table progress bar
+		if process_id:
+			bar = self._queue_progress_bars.get(process_id)
+			if bar:
+				bar.setMaximum(total)
+				bar.setValue(idx)
+				bar.setFormat(f"{idx} / {total} posted")
 	
 	def _on_multi_worker_finished(self, process_id: str, instance_serial: str, result: dict[str, Any]) -> None:
 		"""Handle completion of multi-media worker.
@@ -481,47 +1088,51 @@ class ReelsPosterPage(QWidget):
 		if self._is_closing:
 			return
 		
-		# Update table with final results (for backward compatibility with single-media table)
+		self._log(f"[WORKER-FINISH] ===== _on_multi_worker_finished callback =====")
+		self._log(f"[WORKER-FINISH] Process ID: {process_id[:8]}")
+		self._log(f"[WORKER-FINISH] Instance serial: {instance_serial}")
+		self._log(f"[WORKER-FINISH] Active workers before cleanup: {list(self._workers_by_pid.keys())}")
+		
 		total = result.get("total", 0)
 		success = result.get("success", 0)
 		fail = result.get("fail", 0)
 		cancelled = result.get("cancelled", False)
-		results_list = result.get("results", [])
 		
-		for post_result in results_list:
-			media_name = Path(post_result.media_path).name
-			status = "SUCCESS" if post_result.success else "FAILED"
-			error = post_result.error or ""
-			
-			# Find row for this media
-			for row_idx in range(self.table.rowCount()):
-				item = self.table.item(row_idx, self.COL_MEDIA)
-				if item and item.text() == media_name:
-					self.table.setItem(row_idx, self.COL_STATUS, QTableWidgetItem(status))
-					self.table.setItem(row_idx, self.COL_ERROR, QTableWidgetItem(error))
-					break
+		self._log(f"[WORKER-FINISH] Results: total={total}, success={success}, fail={fail}, cancelled={cancelled}")
 		
 		# Log summary
 		if cancelled:
-			self._log(f"Process {process_id[:8]} cancelled by user.")
+			self._log(f"[WORKER-FINISH] Process status: CANCELLED")
 		else:
-			self._log(f"Process {process_id[:8]} finished: success={success} fail={fail}")
+			self._log(f"[WORKER-FINISH] Process status: COMPLETED (success={success} fail={fail})")
 		
-		# Notify queue manager
+		# Update queue result summary column
+		result_text = "Cancelled" if cancelled else f"\u2713 {success}  \u2717 {fail}"
+		self._update_queue_result(process_id, result_text)
+		
+		# Notify queue manager to release lock and try next process
+		self._log(f"[WORKER-FINISH] Notifying queue manager to release lock")
 		if cancelled:
-			self.queue_manager.mark_process_failed(process_id, "Cancelled by user")
+			self.queue_manager.mark_failed(process_id, "Cancelled by user")
 		else:
-			self.queue_manager.mark_process_complete(process_id, success, fail)
+			self.queue_manager.mark_completed(process_id, success, fail)
+		self._log(f"[WORKER-FINISH] Queue manager notified")
 		
 		# Cleanup worker/thread for this process
+		self._log(f"[WORKER-FINISH] Cleaning up worker and thread for {process_id[:8]}")
 		self._running_serials.discard(instance_serial)
 		if process_id in self._workers_by_pid:
+			self._log(f"[WORKER-FINISH] Removing worker from _workers_by_pid")
 			del self._workers_by_pid[process_id]
 		if process_id in self._threads_by_pid:
+			self._log(f"[WORKER-FINISH] Stopping and removing thread from _threads_by_pid")
 			thread = self._threads_by_pid[process_id]
 			thread.quit()
 			thread.wait()
 			del self._threads_by_pid[process_id]
+		
+		self._log(f"[WORKER-FINISH] Active workers after cleanup: {list(self._workers_by_pid.keys())}")
+		self._log(f"[WORKER-FINISH] ===== Worker cleanup complete for {process_id[:8]} =====")
 		
 		# Re-enable buttons if no processes are running
 		if not self._running_serials:
@@ -537,25 +1148,47 @@ class ReelsPosterPage(QWidget):
 		self.folder_input.clear()
 		self.media_list.clear()
 		self._media_paths.clear()
+		self._update_media_counter()
 		# Keep page input for convenience
 	
 	def _clear_completed_processes(self) -> None:
 		"""Remove completed/failed processes from queue table."""
 		rows_to_remove = []
 		for row in range(self.queue_table.rowCount()):
-			status_item = self.queue_table.item(row, 5)  # Status column
+			status_item = self.queue_table.item(row, self.COL_Q_STATUS)
 			if status_item and status_item.text() in ("Completed", "Failed"):
 				rows_to_remove.append(row)
+		
+		if not rows_to_remove:
+			return
+		
+		reply = QMessageBox.question(
+			self, "Clear Completed",
+			f"Remove {len(rows_to_remove)} completed/failed process(es)?",
+			QMessageBox.Yes | QMessageBox.No,
+			QMessageBox.Yes,
+		)
+		if reply != QMessageBox.Yes:
+			return
+		
+		# Clean up progress bar references
+		for row in rows_to_remove:
+			item = self.queue_table.item(row, self.COL_Q_INSTANCE)
+			if item:
+				self._queue_progress_bars.pop(item.data(Qt.UserRole), None)
 		
 		# Remove in reverse order to avoid index shifting
 		for row in reversed(rows_to_remove):
 			self.queue_table.removeRow(row)
+		
+		self.queue_manager.clear_completed()
+		self._update_empty_states()
 	
 	# ------------------------------------------------------------------
-	# Queue manager signal handlers
+	# Queue manager callbacks
 	# ------------------------------------------------------------------
-	def _on_queue_process_added(self, process_info: Any) -> None:
-		"""Handle process added to queue."""
+	def _on_queue_process_queued(self, process: ProcessSnapshot) -> None:
+		"""Handle process queued - add row to queue table."""
 		if self._is_closing:
 			return
 		
@@ -563,55 +1196,94 @@ class ReelsPosterPage(QWidget):
 		row = self.queue_table.rowCount()
 		self.queue_table.insertRow(row)
 		
-		instance_names = process_info.instance_name
-		page = process_info.jobs[0].target_page if process_info.jobs else ""
-		mode = "Now" if process_info.scheduled_at is None else "Scheduled"
+		page = process.page_name
+		media_count = len(process.jobs)
+		mode = "Immediate" if process.scheduled_at is None else "Scheduled"
 		schedule_time = ""
-		if process_info.scheduled_at:
-			schedule_time = process_info.scheduled_at.strftime("%Y-%m-%d %H:%M")
+		if process.scheduled_at:
+			schedule_time = process.scheduled_at.strftime("%Y-%m-%d %H:%M")
 		
-		self.queue_table.setItem(row, 0, QTableWidgetItem(instance_names))
-		self.queue_table.setItem(row, 1, QTableWidgetItem(page))
-		self.queue_table.setItem(row, 2, QTableWidgetItem(str(len(process_info.jobs))))
-		self.queue_table.setItem(row, 3, QTableWidgetItem(mode))
-		self.queue_table.setItem(row, 4, QTableWidgetItem(schedule_time))
-		self.queue_table.setItem(row, 5, QTableWidgetItem(process_info.status))
+		# Instance (stores process_id as UserRole)
+		inst_item = QTableWidgetItem(process.instance_name)
+		inst_item.setData(Qt.UserRole, process.process_id)
+		self.queue_table.setItem(row, self.COL_Q_INSTANCE, inst_item)
+		self.queue_table.setItem(row, self.COL_Q_PAGE, QTableWidgetItem(page))
+		self.queue_table.setItem(row, self.COL_Q_MEDIA, QTableWidgetItem(str(media_count)))
+		self.queue_table.setItem(row, self.COL_Q_MODE, QTableWidgetItem(mode))
+		self.queue_table.setItem(row, self.COL_Q_SCHEDULE, QTableWidgetItem(schedule_time))
 		
-		# Store process_id in row
-		self.queue_table.item(row, 0).setData(Qt.UserRole, process_info.process_id)
+		# Color-coded status
+		status = "queued"
+		status_item = QTableWidgetItem(status)
+		color = STATUS_COLORS.get(status, "#333")
+		status_item.setForeground(QColor(color))
+		self.queue_table.setItem(row, self.COL_Q_STATUS, status_item)
+		
+		# Progress bar
+		bar = QProgressBar()
+		bar.setRange(0, media_count)
+		bar.setValue(0)
+		bar.setFormat(f"0 / {media_count} posted")
+		self.queue_table.setCellWidget(row, self.COL_Q_PROGRESS, bar)
+		self._queue_progress_bars[process.process_id] = bar
+		
+		# Result column (empty initially)
+		self.queue_table.setItem(row, self.COL_Q_RESULT, QTableWidgetItem(""))
+		
+		self._update_empty_states()
 	
-	def _on_queue_status_changed(self, process_id: str, new_status: str) -> None:
-		"""Handle process status change."""
+	def _on_queue_status_changed(self, process_id: str, status: str) -> None:
+		"""Handle process status change with color coding."""
 		if self._is_closing:
 			return
 		
-		# Find row with this process_id
+		# Update internal tracking
+		self._process_status[process_id] = status
+		
 		for row in range(self.queue_table.rowCount()):
-			item = self.queue_table.item(row, 0)
+			item = self.queue_table.item(row, self.COL_Q_INSTANCE)
 			if item and item.data(Qt.UserRole) == process_id:
-				self.queue_table.setItem(row, 5, QTableWidgetItem(new_status))
+				status_item = QTableWidgetItem(status)
+				color = STATUS_COLORS.get(status, "#333")
+				status_item.setForeground(QColor(color))
+				self.queue_table.setItem(row, self.COL_Q_STATUS, status_item)
 				break
 	
-	def _on_queue_process_started(self, process_id: str) -> None:
+	def _on_queue_process_started(self, process: ProcessSnapshot) -> None:
 		"""Handle process started from queue.
 		
-		Extracts process info and creates a worker for parallel execution.
-		The queue manager guarantees the instance serial is free at this point.
+		Creates a worker for parallel execution.
+		The queue manager guarantees the instance is free at this point.
 		"""
 		if self._is_closing:
 			return
 		
-		process_info = self.queue_manager.processes.get(process_id)
-		if not process_info:
+		self._log(f"[WORKER] ===== _on_queue_process_started callback =====")
+		self._log(f"[WORKER] Process: {process.process_id[:8]}")
+		self._log(f"[WORKER] Instance: {process.instance_name} (serial={process.instance_serial})")
+		self._log(f"[WORKER] Starting worker for process")
+		
+		# Look up instance object by serial
+		state = self.get_state_fn()
+		instances = [inst for inst in state.instances if inst.adb_serial == process.instance_serial]
+		
+		if not instances:
+			self._log(f"[WORKER] ✗ ERROR: Could not find instance with serial {process.instance_serial}")
+			self._log(f"[WORKER] Available instances: {[(inst.name, inst.adb_serial) for inst in state.instances]}")
+			self.queue_manager.mark_failed(process.process_id, f"Instance {process.instance_serial} not found")
 			return
+		
+		self._log(f"[WORKER] ✓ Found instance: {instances[0].name} ({instances[0].adb_serial})")
 		
 		# Start the worker for this process
 		self._start_multi_media_worker(
-			process_id,
-			process_info.instance_serial,
-			process_info.jobs,
-			[process_info.instance]
+			process.process_id,
+			process.instance_serial,
+			process.jobs,
+			instances  # Pass found instance(s)
 		)
+		
+		self._log(f"[WORKER] Worker thread started for process {process.process_id[:8]}")
 		
 		# Keep Start enabled so user can queue more processes
 		self.stop_btn.setEnabled(True)
@@ -621,18 +1293,22 @@ class ReelsPosterPage(QWidget):
 		if self._is_closing:
 			return
 		self._log(f"Queue process {process_id[:8]} completed: {success_count} success, {fail_count} failed")
+		self._update_queue_result(process_id, f"\u2713 {success_count}  \u2717 {fail_count}")
 	
 	def _on_queue_process_failed(self, process_id: str, error: str) -> None:
 		"""Handle process failure from queue."""
 		if self._is_closing:
 			return
 		self._log(f"Queue process {process_id[:8]} failed: {error}")
-	
-	def _on_queue_log_message(self, message: str) -> None:
-		"""Handle log message from queue manager."""
-		if self._is_closing:
-			return
-		self._log(message)
+		self._update_queue_result(process_id, f"\u2717 {error}")
+
+	def _update_queue_result(self, process_id: str, text: str) -> None:
+		"""Update the Result column for a queue row."""
+		for row in range(self.queue_table.rowCount()):
+			item = self.queue_table.item(row, self.COL_Q_INSTANCE)
+			if item and item.data(Qt.UserRole) == process_id:
+				self.queue_table.setItem(row, self.COL_Q_RESULT, QTableWidgetItem(text))
+				break
 
 	def _build_run_payload(self, test_mode: bool) -> dict[str, Any] | None:
 		selected_media: list[str] = []
@@ -645,9 +1321,16 @@ class ReelsPosterPage(QWidget):
 			self._log("No media selected.")
 			return None
 
+		# Freshly resolve ADB serials for selected instances
+		self._resolve_selected_serials()
+
 		selected_instances = [inst for inst in self.get_state_fn().get_selected_instances() if inst.adb_serial]
 		if not selected_instances:
-			self._log("No selected instance with ADB serial.")
+			self._log(
+				"No selected instance with ADB serial. "
+				"Instance may be running but ADB not attached yet. "
+				"Please wait a moment and click Refresh ADB on the Instances tab."
+			)
 			return None
 
 		page = self.page_input.text().strip()
@@ -689,6 +1372,12 @@ class ReelsPosterPage(QWidget):
 					max_attempts=self.retry_spin.value(),
 					last_error=None,
 					label=label,
+					use_smart_title=self.smart_title_checkbox.isChecked(),
+					use_ai_retitle=self.ai_retitle_checkbox.isChecked(),
+					ai_target_language=self.ai_language_combo.currentText(),
+					ai_caption_cache=None,
+				have_subfolder=self.use_subfolder_checkbox.isChecked(),
+				subfolder_name=self.subfolder_name_input.text().strip(),
 				)
 			)
 		
@@ -716,6 +1405,7 @@ class ReelsPosterPage(QWidget):
 			skip_push_media=True,
 			fallback_push_if_missing=False,
 			get_adbkeyboard_request_fn=self._create_adbkeyboard_request,
+			get_config_fn=self.get_config_fn,
 		)
 		queue = ReelJobQueue(persist_path=None)
 
@@ -846,29 +1536,17 @@ class ReelsPosterPage(QWidget):
 		if self._is_closing:
 			return
 		self._log(message)
-		self.instance_log.appendPlainText(message)
 
 	def _on_worker_error(self, message: str) -> None:
 		if self._is_closing:
 			return
 		self._log(f"Worker error: {message}")
-		self.instance_log.appendPlainText(f"Worker error: {message}")
 
 	def _on_worker_done(self, result: Any) -> None:
 		if self._is_closing:
 			return
 
 		if isinstance(result, dict) and result.get("type") == "run":
-			rows = result.get("rows", {})
-			for job_id, state in rows.items():
-				row = self._job_row_map.get(job_id)
-				if row is None:
-					continue
-				self.table.setItem(row, self.COL_INSTANCE, QTableWidgetItem(state.get("instance", "")))
-				self.table.setItem(row, self.COL_STATUS, QTableWidgetItem(state.get("status", "")))
-				self.table.setItem(row, self.COL_ATTEMPTS, QTableWidgetItem(state.get("attempts", "0")))
-				self.table.setItem(row, self.COL_ERROR, QTableWidgetItem(state.get("error", "")))
-
 			if result.get("stopped"):
 				self._log("Run stopped.")
 			else:

@@ -4,8 +4,9 @@ Provides utilities for listing, finding, and manipulating windows across
 one or more monitors on Windows systems.
 """
 
-from typing import Dict, List, Tuple, Callable, Any
+from typing import Dict, List, Optional, Tuple, Callable, Any
 import ctypes
+import math
 from ctypes.wintypes import RECT
 
 try:
@@ -253,3 +254,97 @@ class WindowManager:
                 )
             except Exception:  # pragma: no cover - defensive
                 pass
+
+    # ------------------------------------------------------------------
+    # Auto-arrange all LDPlayer windows
+    # ------------------------------------------------------------------
+    @staticmethod
+    def find_ldplayer_windows() -> List[Dict[str, Any]]:
+        """Return all visible windows whose title contains ``LDPlayer``.
+
+        Each entry has keys ``hwnd``, ``title``, ``pid``.
+        Results are sorted by title for deterministic ordering.
+        """
+        all_wins = WindowManager.list_top_level_windows()
+        ld_wins = [w for w in all_wins if "ldplayer" in w["title"].lower()]
+        ld_wins.sort(key=lambda w: w["title"])
+        return ld_wins
+
+
+def arrange_ldplayer_windows(
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> int:
+    """Detect all LDPlayer instance windows and tile them on screen.
+
+    Grid is computed automatically::
+
+        cols = ceil(sqrt(n))
+        rows = ceil(n / cols)
+
+    Each window is resized to ``(screen_w / cols, screen_h / rows)`` and
+    placed at the corresponding grid cell.  Minimised windows are restored
+    first.
+
+    Args:
+        log_fn: optional callback for log messages (e.g. UI log panel).
+
+    Returns:
+        The number of windows that were arranged.
+    """
+    _log = log_fn or (lambda m: None)
+
+    # 1. Discover LDPlayer windows
+    ld_wins = WindowManager.find_ldplayer_windows()
+    count = len(ld_wins)
+    if count == 0:
+        _log("No LDPlayer windows found.")
+        return 0
+    _log(f"Found {count} LDPlayer window(s)")
+
+    # 2. Compute grid
+    cols = math.ceil(math.sqrt(count))
+    rows = math.ceil(count / cols)
+    _log(f"Grid layout: {rows} row(s) × {cols} col(s)")
+
+    # 3. Get screen work area (primary monitor)
+    work_areas = WindowManager.get_monitor_work_areas()
+    if not work_areas:
+        _log("Could not determine screen work area.")
+        return 0
+    left, top, right, bottom = work_areas[0]
+    screen_w = right - left
+    screen_h = bottom - top
+
+    win_w = int(screen_w / cols)
+    win_h = int(screen_h / rows)
+    _log(f"Screen work area: {screen_w}×{screen_h}  Window size: {win_w}×{win_h}")
+
+    # 4. Arrange each window
+    arranged = 0
+    for idx, win_info in enumerate(ld_wins):
+        hwnd = win_info["hwnd"]
+        title = win_info["title"]
+
+        r = idx // cols
+        c = idx % cols
+        x = left + c * win_w
+        y = top + r * win_h
+
+        try:
+            # Restore if minimised
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_TOP,
+                x, y, win_w, win_h,
+                win32con.SWP_NOZORDER | win32con.SWP_SHOWWINDOW,
+            )
+            arranged += 1
+            _log(f"  [{idx}] '{title}' hwnd={hwnd} → ({x},{y}) {win_w}×{win_h}")
+        except Exception as exc:
+            _log(f"  [{idx}] '{title}' hwnd={hwnd} → FAILED: {exc}")
+
+    _log(f"Arranged {arranged}/{count} window(s)")
+    return arranged

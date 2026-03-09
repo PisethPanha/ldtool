@@ -1,17 +1,11 @@
 {
-  "name": "fb_scroll_only_anti_tap_720p",
+  "name": "fb_scroll_safe_offcenter_fast",
   "steps": [
-
-    { "wait": 1200 },
-    { "swipe": [360, 1080, 360, 10, 1000] },
-    { "wait": 700 },
-    { "swipe": [360, 1080, 360, 10, 1000] },
-    { "wait": 700 },
-    { "swipe": [360, 1080, 360, 10, 1000] },
-    { "wait": 700 },
-    { "swipe": [360, 1080, 360, 10, 1000] },
-    { "wait": 700 },
-    { "swipe": [360, 1080, 360, 10, 1000] },
-    { "wait": 700 }
+    { "wait": 2200 },
+    { "swipe": [365, 0, 365, 1080, 220], "safe_feed_scroll": true },
+    { "swipe": [365, 0, 365, 1080, 220], "safe_feed_scroll": true },
+    { "wait": 2600 },
+    { "swipe": [365, 0, 365, 1080, 220], "safe_feed_scroll": true },
+    { "swipe": [365, 0, 365, 1080, 220], "safe_feed_scroll": true }
   ]
 }

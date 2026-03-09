@@ -6,8 +6,9 @@ built-in error handling and timeouts.
 
 from __future__ import annotations
 
+import re
 import time
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 
 
 class ADBManager:
@@ -187,3 +188,111 @@ class ADBManager:
         except Exception as exc:
             self._log(f"error force-stopping {package} on {serial}: {exc}")
             return False
+
+    # ------------------------------------------------------------------
+    # Instance-to-serial resolution
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def serial_for_index(index: int) -> str:
+        """Return the expected ADB serial for a given LDPlayer instance index.
+
+        LDPlayer9 uses ``emulator-{5554 + index * 2}`` as the ADB serial.
+        """
+        return f"emulator-{5554 + index * 2}"
+
+    @staticmethod
+    def index_from_serial(serial: str) -> Optional[int]:
+        """Extract the LDPlayer instance index from an ADB serial, or None."""
+        m = re.match(r"emulator-(\d+)", serial)
+        if m:
+            port = int(m.group(1))
+            if port >= 5554 and (port - 5554) % 2 == 0:
+                return (port - 5554) // 2
+        # Also handle 127.0.0.1:PORT style (port = 5555 + index * 2)
+        m = re.match(r"127\.0\.0\.1:(\d+)", serial)
+        if m:
+            port = int(m.group(1))
+            if port >= 5555 and (port - 5555) % 2 == 0:
+                return (port - 5555) // 2
+        return None
+
+    def resolve_instance_serials(
+        self,
+        instances: List[Dict],
+        wait_timeout: int = 15,
+    ) -> Dict[int, str]:
+        """Resolve ADB serials for running LDPlayer instances.
+
+        1. Lists current ADB devices.
+        2. For each running instance, checks if its expected serial is online.
+        3. For unresolved running instances, polls for ``wait_timeout`` seconds.
+        4. Verifies boot readiness for resolved devices.
+
+        Returns a mapping of ``{instance_index: adb_serial}``.
+        """
+        running = [
+            inst for inst in instances
+            if inst.get("is_running")
+        ]
+        if not running:
+            self._log("No running instances to resolve.")
+            return {}
+
+        self._log(f"Resolving ADB serials for {len(running)} running instance(s)...")
+
+        resolved: Dict[int, str] = {}
+
+        # First pass: check which expected serials are already visible
+        devices = set(self.list_devices())
+        self._log(f"ADB devices online: {sorted(devices)}")
+
+        pending_indexes: List[int] = []
+        for inst in running:
+            idx = int(inst["index"])
+            expected = self.serial_for_index(idx)
+            if expected in devices:
+                self._log(f"  Instance {idx} ({inst.get('name','')}) → {expected} (found)")
+                resolved[idx] = expected
+            else:
+                self._log(f"  Instance {idx} ({inst.get('name','')}) → {expected} (not yet visible)")
+                pending_indexes.append(idx)
+
+        # Second pass: wait for pending instances
+        if pending_indexes:
+            self._log(f"Waiting up to {wait_timeout}s for {len(pending_indexes)} instance(s) to appear in ADB...")
+            elapsed = 0.0
+            while pending_indexes and elapsed < wait_timeout:
+                time.sleep(1)
+                elapsed += 1
+                devices = set(self.list_devices())
+                still_pending = []
+                for idx in pending_indexes:
+                    expected = self.serial_for_index(idx)
+                    if expected in devices:
+                        self._log(f"  Instance {idx} → {expected} (appeared after {elapsed:.0f}s)")
+                        resolved[idx] = expected
+                    else:
+                        still_pending.append(idx)
+                pending_indexes = still_pending
+
+            for idx in pending_indexes:
+                inst_name = next(
+                    (i.get("name", "") for i in running if int(i["index"]) == idx), ""
+                )
+                self._log(
+                    f"  ⚠ Instance {idx} ({inst_name}) is running but no ADB device "
+                    f"appeared after {wait_timeout}s. Try Refresh again later."
+                )
+
+        # Third pass: verify boot readiness for resolved devices
+        for idx, serial in list(resolved.items()):
+            if self.is_device_ready(serial):
+                self._log(f"  Instance {idx} ({serial}): boot complete ✓")
+            else:
+                self._log(f"  Instance {idx} ({serial}): still booting (usable but may be slow)")
+
+        self._log(
+            f"Serial resolution complete: {len(resolved)}/{len(running)} mapped."
+        )
+        return resolved

@@ -10,6 +10,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
     QFileDialog,
+    QGroupBox,
+    QFormLayout,
 )
 
 from src.core.config import load_config, save_config
@@ -32,32 +34,64 @@ class SetupPage(QWidget):
         super().__init__(parent)
         self._log = log_fn
 
-        # input widgets
-        self.ld_dir_edit = QLineEdit()
-        browse_btn = QPushButton("Browse...")
-        browse_btn.clicked.connect(self._browse_ld_dir)
+        # Create main layout with compact margins
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(8)
 
+        # Compact configuration card
+        config_group = QGroupBox("LDPlayer Configuration")
+        config_layout = QFormLayout(config_group)
+        config_layout.setContentsMargins(10, 10, 10, 10)
+        config_layout.setSpacing(6)
+        config_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        # LDPlayer folder input with browse button
+        ld_folder_row = QHBoxLayout()
+        ld_folder_row.setSpacing(6)
+        self.ld_dir_edit = QLineEdit()
+        self.ld_dir_edit.setFixedHeight(30)
+        self.ld_dir_edit.setPlaceholderText("Select LDPlayer installation folder")
+        browse_btn = QPushButton("Browse...")
+        browse_btn.setFixedHeight(30)
+        browse_btn.setFixedWidth(90)
+        browse_btn.clicked.connect(self._browse_ld_dir)
+        ld_folder_row.addWidget(self.ld_dir_edit)
+        ld_folder_row.addWidget(browse_btn)
+        ld_folder_label = QLabel("LDPlayer Folder:")
+        ld_folder_label.setStyleSheet("padding: 10px; border-radius: 10px; background-color: #2a2c3e;")
+        config_layout.addRow(ld_folder_label, ld_folder_row)
+
+        # dnconsole executable (read-only display)
         self.dnconsole_edit = QLineEdit()
         self.dnconsole_edit.setReadOnly(True)
+        self.dnconsole_edit.setFixedHeight(30)
+        self.dnconsole_edit.setPlaceholderText("Auto-detected path will appear here")
+        dnconsole_label = QLabel("dnconsole:")
+        dnconsole_label.setStyleSheet("padding: 10px; border-radius: 10px; background-color: #2a2c3e;")
+        config_layout.addRow(dnconsole_label, self.dnconsole_edit)
+
+        # adb executable (read-only display)
         self.adb_edit = QLineEdit()
         self.adb_edit.setReadOnly(True)
+        self.adb_edit.setFixedHeight(30)
+        self.adb_edit.setPlaceholderText("Auto-detected path will appear here")
+        adb_label = QLabel("adb:")
+        adb_label.setStyleSheet("padding: 10px; border-radius: 10px; background-color: #2a2c3e;")
+        config_layout.addRow(adb_label, self.adb_edit)
 
-        test_btn = QPushButton("Test")
+        # Test button
+        test_btn = QPushButton("Test Configuration")
+        test_btn.setFixedHeight(32)
+        test_btn.setFixedWidth(150)
         test_btn.clicked.connect(self._test_and_save)
+        test_btn_layout = QHBoxLayout()
+        test_btn_layout.addWidget(test_btn)
+        test_btn_layout.addStretch()
+        config_layout.addRow("", test_btn_layout)
 
-        # layout
-        layout = QVBoxLayout(self)
-        row = QHBoxLayout()
-        row.addWidget(QLabel("LDPlayer folder:"))
-        row.addWidget(self.ld_dir_edit)
-        row.addWidget(browse_btn)
-        layout.addLayout(row)
-
-        layout.addWidget(QLabel("dnconsole executable:"))
-        layout.addWidget(self.dnconsole_edit)
-        layout.addWidget(QLabel("adb executable:"))
-        layout.addWidget(self.adb_edit)
-        layout.addWidget(test_btn)
+        main_layout.addWidget(config_group)
+        main_layout.addStretch()
 
         # populate from existing configuration
         cfg = load_config()

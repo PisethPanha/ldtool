@@ -248,6 +248,23 @@ class ProcessQueueManager(QObject):
 		# Try to start next process
 		self.start_next_available()
 	
+	def cancel_process(self, process_id: str) -> bool:
+		"""Cancel a waiting process (remove from queue without starting it)."""
+		process = self.processes.get(process_id)
+		if not process:
+			return False
+		if process.status != "Waiting":
+			return False
+		
+		process.status = "Failed"
+		process.error = "Cancelled by user"
+		process.finished_at = datetime.now()
+		
+		self._log(f"[Queue] Process cancelled: {process.instance_name}")
+		self.process_failed.emit(process_id, "Cancelled by user")
+		self.status_changed.emit(process_id, "Failed")
+		return True
+	
 	def _check_scheduled_processes(self) -> None:
 		"""Check if any scheduled processes are ready to start."""
 		self.start_next_available()

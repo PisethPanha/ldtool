@@ -1,9 +1,9 @@
-from PySide6.QtCore import Qt, QDateTime, QObject, Signal
+from PySide6.QtCore import Qt, QDateTime, QObject, Signal, QTimer
 from PySide6.QtWidgets import (
     QMainWindow,
     QTabWidget,
-    QPlainTextEdit,
     QDockWidget,
+    QLabel,
 )
 
 from src.core.config import load_config
@@ -14,6 +14,7 @@ from .instances_page import InstancesPage
 from .app_launcher_page import AppLauncherPage
 from .macro_runner_page import MacroRunnerPage
 from .reels_poster_page import ReelsPosterPage
+from .enhanced_log_panel import EnhancedLogPanel
 
 
 class LogBus(QObject):
@@ -40,7 +41,8 @@ class MainWindow(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("LDTool")
-        self.resize(800, 600)
+        self.resize(1100, 650)
+        self.setMinimumSize(900, 950)
 
         # Initialize app state and managers
         self.state = AppState.instance()
@@ -59,6 +61,7 @@ class MainWindow(QMainWindow):
         )
         
         self._create_tabs()
+        self._create_status_bar()
 
     # ------------------------------------------------------------------
     # UI construction helpers
@@ -73,6 +76,7 @@ class MainWindow(QMainWindow):
         self.instances_tab = InstancesPage(self.log_bus.message.emit, self.get_config, self.get_app_state)
         self.app_launcher_tab = AppLauncherPage(
             self.log_bus.message.emit,
+            self.get_config,
             self.get_app_state,
             self.get_adb_manager,
         )
@@ -80,6 +84,7 @@ class MainWindow(QMainWindow):
             self.log_bus.message.emit,
             self.get_app_state,
             self.get_adb_manager,
+            self.get_config,
         )
         self.reels_poster_tab = ReelsPosterPage(
             self.log_bus.message.emit,
@@ -96,19 +101,39 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.reels_poster_tab, "Reels Poster")
 
     def _create_log_panel(self) -> None:
-        """Create a dockable, read‑only text widget for logging.
+        """Create a dockable, enhanced log widget for logging.
 
         This is called before any tabs are instantiated so that ``self.log``
         can safely be used during page initialization.
         """
 
-        self.log_widget = QPlainTextEdit()
-        self.log_widget.setReadOnly(True)
+        self.log_widget = EnhancedLogPanel()
 
-        dock = QDockWidget("Log", self)
+        dock = QDockWidget("System Log", self)
         dock.setWidget(self.log_widget)
         dock.setAllowedAreas(Qt.BottomDockWidgetArea)
+        dock.setMaximumHeight(150)
+        dock.setMinimumHeight(100)
         self.addDockWidget(Qt.BottomDockWidgetArea, dock)
+
+    def _create_status_bar(self) -> None:
+        """Create a persistent status bar with runtime summary labels."""
+        bar = self.statusBar()
+        self.instances_status = QLabel("Instances: 0 running")
+        self.queue_status = QLabel("Queue: 0 tasks")
+        self.ldplayer_status = QLabel("LDPlayer: detected")
+        self.adb_status = QLabel("ADB: connected")
+
+        bar.addPermanentWidget(self.instances_status)
+        bar.addPermanentWidget(self.queue_status)
+        bar.addPermanentWidget(self.ldplayer_status)
+        bar.addPermanentWidget(self.adb_status)
+
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(2500)
+        self._status_timer.timeout.connect(self._refresh_status_bar)
+        self._status_timer.start()
+        self._refresh_status_bar()
 
     # ------------------------------------------------------------------
     # Public API
@@ -128,16 +153,35 @@ class MainWindow(QMainWindow):
             self._adb_manager = ADBManager(cfg.get("adb_path", ""), self.log_bus.message.emit)
         return self._adb_manager
 
+    def _refresh_status_bar(self) -> None:
+        """Refresh live status bar indicators without changing app behaviour."""
+        try:
+            selected_count = len(self.state.get_selected_instances())
+        except Exception:
+            selected_count = 0
+
+        queue_count = 0
+        try:
+            queue_count = len(self.reels_poster_tab.queue_manager.processes)
+        except Exception:
+            queue_count = 0
+
+        self.instances_status.setText(f"Instances: {selected_count} selected")
+        self.queue_status.setText(f"Queue: {queue_count} tasks")
+
+        try:
+            adb = self.get_adb_manager()
+            self.adb_status.setText("ADB: connected" if adb.list_devices() else "ADB: no devices")
+        except Exception:
+            self.adb_status.setText("ADB: unavailable")
+
+        cfg = self.get_config()
+        has_dnconsole = bool(cfg.get("dnconsole_path", "").strip())
+        self.ldplayer_status.setText("LDPlayer: detected" if has_dnconsole else "LDPlayer: not configured")
+
     def _append_log(self, message: str) -> None:
-        """Append ``message`` to the log panel with a timestamp.
-
-        The timestamp is formatted as ``YYYY-MM-DD HH:MM:SS``.  This method
-        can be called from anywhere in the application provided a reference
-        to the main window is available.
-        """
-
-        timestamp = QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss")
-        self.log_widget.appendPlainText(f"[{timestamp}] {message}")
+        """Append ``message`` to the enhanced log panel with colour coding."""
+        self.log_widget.append_message(message)
 
     def log(self, message: str) -> None:
         self.log_bus.message.emit(message)

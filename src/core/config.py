@@ -25,6 +25,20 @@ DEFAULTS: Dict[str, str] = {
     "ldplayer_dir": "",
     "dnconsole_path": "",
     "adb_path": "",
+    "theme": "light",
+    # Desktop-click fallback calibration (relative coords 0.0–1.0)
+    "dc_macro_toolbar_rel_x": "0.985",
+    "dc_macro_toolbar_rel_y": "0.30",
+    "dc_macro_item_rel_x": "0.93",
+    "dc_macro_item_rel_y": "0.55",
+    "dc_close_panel_rel_x": "0.0",
+    "dc_close_panel_rel_y": "0.0",
+    "dc_panel_open_delay_ms": "800",
+    # AI Captioning for Reels Poster
+    "gemini_api_key": "",
+    "use_smart_title": "false",
+    "use_ai_retitle": "false",
+    "ai_target_language": "English",
 }
 
 

@@ -55,6 +55,7 @@ class MultiReelPosterWorker(QObject):
 		adb_manager: Any,
 		get_adbkeyboard_request_fn: Callable[[str], Any],
 		log_fn: Callable[[str], None] | None = None,
+		get_config_fn: Callable[[], dict[str, Any]] | None = None,
 	):
 		"""Initialize the worker.
 		
@@ -66,6 +67,7 @@ class MultiReelPosterWorker(QObject):
 			adb_manager: ADB manager instance
 			get_adbkeyboard_request_fn: Callback for ADBKeyboard requests
 			log_fn: Optional logging function (in addition to signals)
+			get_config_fn: Optional callback to get config dict
 		"""
 		super().__init__()
 		self.process_id = process_id
@@ -75,6 +77,7 @@ class MultiReelPosterWorker(QObject):
 		self.adb_manager = adb_manager
 		self.get_adbkeyboard_request_fn = get_adbkeyboard_request_fn
 		self.log_fn = log_fn
+		self.get_config_fn = get_config_fn or (lambda: {})
 		self.cancel_requested = False
 		
 	def _log(self, msg: str) -> None:
@@ -116,9 +119,12 @@ class MultiReelPosterWorker(QObject):
 					skip_push_media=True,
 					fallback_push_if_missing=False,
 					get_adbkeyboard_request_fn=self.get_adbkeyboard_request_fn,
+					get_config_fn=self.get_config_fn,
 				)
 				
 				device_media_path = f"/sdcard/shared/Pictures/{media_name}"
+				if job.have_subfolder and job.subfolder_name:
+					device_media_path = f"/sdcard/shared/Pictures/{job.subfolder_name}/{media_name}"
 				success, error = poster.run(instance.adb_serial, job, device_media_path)
 				
 				if success:

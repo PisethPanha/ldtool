@@ -86,8 +86,9 @@ class LDPlayerController:
                 continue
 
             # Extract fields
+            # CSV columns: index, name, topHandle, bindHandle, is_running, pid1, pid2, width, height, dpi
             name = row[1] if len(row) > 1 else ""
-            is_running = row[2] == "1" if len(row) > 2 else False
+            is_running = int(row[4]) >= 1 if len(row) > 4 and self._is_valid_int(row[4]) else False
 
             # Extract width and height from last 3 columns if available
             width = 0

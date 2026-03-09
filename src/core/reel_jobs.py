@@ -24,6 +24,12 @@ class ReelJob:
 	max_attempts: int
 	last_error: str | None
 	label: int = 0  # For ordered posting
+	use_smart_title: bool = False  # Parse filename locally
+	use_ai_retitle: bool = False
+	ai_target_language: str = "English"
+	ai_caption_cache: dict | None = None
+	have_subfolder: bool = False
+	subfolder_name: str = ""
 
 
 class ReelJobQueue:
