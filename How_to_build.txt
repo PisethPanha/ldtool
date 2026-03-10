@@ -1,0 +1,159 @@
+1. Clean old build output first.
+
+Open terminal in your project root and delete old folders if they exist:
+
+```bash
+rmdir /s /q build
+rmdir /s /q dist
+del /q LDTool.spec
+```
+
+If you already want to keep your `.spec`, only delete `build` and `dist`.
+
+2. Make sure your project has this structure.
+
+```text
+LDTool/
+├─ main.py
+├─ assets/
+│  ├─ icons/
+│  │  └─ ldtool.ico
+│  └─ styles/
+│     └─ dark_theme.qss
+├─ src/
+│  └─ utils/
+│     └─ resource_path.py
+```
+
+3. Make sure your app loads resources with `resource_path()`.
+
+Example:
+
+```python
+from PySide6.QtGui import QIcon
+from src.utils.resource_path import resource_path
+
+self.setWindowIcon(QIcon(resource_path("assets/icons/ldtool.ico")))
+```
+
+And stylesheet:
+
+```python
+with open(resource_path("assets/styles/dark_theme.qss"), "r", encoding="utf-8") as f:
+    app.setStyleSheet(f.read())
+```
+
+4. Install required packages.
+
+```bash
+pip install pyinstaller
+pip install PySide6
+```
+
+If your app uses more packages, install them too before building.
+
+5. Create the spec file manually.
+
+In terminal:
+
+```bash
+pyi-makespec --windowed --icon=assets/icons/ldtool.ico main.py
+```
+
+This creates `main.spec`.
+
+6. Edit the generated spec file.
+
+Open `main.spec` and add your assets into `datas`.
+
+Example:
+
+```python
+datas=[('assets', 'assets')],
+```
+
+If `datas=[]` already exists, replace it.
+
+Also add hidden imports if needed later.
+
+7. Build from the spec file.
+
+```bash
+pyinstaller main.spec
+```
+
+8. Wait until build finishes.
+
+After success, check:
+
+```text
+dist/
+└─ main/
+   ├─ main.exe
+   └─ assets/
+```
+
+If you renamed the spec/app, it may be `dist/LDTool/LDTool.exe`.
+
+9. Test the production app.
+
+Open the `.exe` from `dist`. Check:
+
+* dark background appears
+* icons appear
+* tabs load correctly
+* theme matches development version
+
+10. If theme or icons are still missing, verify these 3 things.
+
+First, make sure `assets` is inside `dist/YourAppName/`.
+
+Second, make sure code uses `resource_path(...)` everywhere.
+
+Third, make sure the spec contains:
+
+```python
+datas=[('assets', 'assets')]
+```
+
+11. Optional: build with one command instead of spec.
+
+If you do not want spec, use:
+
+```bash
+pyinstaller --noconfirm --windowed --icon=assets/icons/ldtool.ico --add-data "assets;assets" --name "LDTool" main.py
+```
+
+12. Recommended manual rebuild flow every time.
+
+```bash
+rmdir /s /q build
+rmdir /s /q dist
+pyinstaller main.spec
+```
+
+13. If build fails and you want to debug, build with console enabled once.
+
+Change in spec:
+
+```python
+console=True
+```
+
+Then rebuild:
+
+```bash
+pyinstaller main.spec
+```
+
+Now when you open the exe, it will show Python/runtime errors in a terminal window.
+
+14. Final packaging.
+
+When everything works, your final exe is usually here:
+
+```text
+dist/LDTool/LDTool.exe
+```
+
+If you want, I can next give you a **full exact `main.spec` file** customized for your LDTool project layout.

@@ -1,9 +1,6 @@
 from __future__ import annotations
-
-from pathlib import Path
-
+from src.utils.resource_path import resource_path
 
 def icon_path(filename: str) -> str:
-    """Return an absolute path for icon files under project ui/icons."""
-    project_root = Path(__file__).resolve().parents[3]
-    return str(project_root / "ui" / "icons" / filename)
+    """Return an absolute path for icon files under assets/icons using resource_path."""
+    return resource_path(f"assets/icons/{filename}")

@@ -59,7 +59,12 @@ def load_config() -> Dict[str, str]:
 
     # Ensure all expected keys exist; fall back to default if missing.
     result = DEFAULTS.copy()
-    result.update({k: str(v) for k, v in cfg.items() if k in result})
+    # Copy all keys, including extra keys (like saved_pages)
+    for k, v in cfg.items():
+        if k in result:
+            result[k] = str(v)
+        else:
+            result[k] = v
     return result
 
 

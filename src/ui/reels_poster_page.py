@@ -95,20 +95,20 @@ class ReelsPosterPage(QWidget):
 		self.task_runner.on_log.connect(self._on_worker_log)
 		self.task_runner.on_error.connect(self._on_worker_error)
 		self.task_runner.on_done.connect(self._on_worker_done)
-		
+
 		# Multi-media worker thread support - now per-process (parallel execution)
 		self._workers_by_pid: dict[str, MultiReelPosterWorker] = {}  # process_id -> worker
 		self._threads_by_pid: dict[str, QThread] = {}  # process_id -> thread
 		self._running_serials: set[str] = set()  # Track which instance serials are active
 		self._queue_progress_bars: dict[str, QProgressBar] = {}  # process_id -> progress bar
-		
+
 		# Process status tracking (since ProcessSnapshot doesn't have status)
 		self._process_status: dict[str, str] = {}  # process_id -> "queued" | "running" | "completed" | "failed"
 
 		# Process queue manager (core business logic)
 		self.queue_manager = ProcessQueueManager(log_fn=self.log_fn)
 		self.log_fn("[INIT] ProcessQueueManager created")
-		
+
 		# Register callbacks (not Qt signals)
 		self.queue_manager.on_process_queued = self._on_queue_process_queued
 		self.queue_manager.on_process_started = self._on_queue_process_started
@@ -117,8 +117,55 @@ class ReelsPosterPage(QWidget):
 		self.queue_manager.on_status_changed = self._on_queue_status_changed
 		self.log_fn("[INIT] ✓ All queue_manager callbacks registered")
 
+		# Saved pages feature
+		self.saved_pages: list[str] = []
 		self._build_ui()
+		self._load_saved_pages()
 		self._load_ai_settings()
+
+	def _load_saved_pages(self):
+		cfg = self.get_config_fn()
+		self.saved_pages = cfg.get("saved_pages", [])
+		if not isinstance(self.saved_pages, list):
+			self.saved_pages = []
+		self._refresh_saved_pages_dropdown()
+
+	def _save_current_page(self):
+		page = self.page_input.text().strip()
+		if not page:
+			self.log_fn("Page name is empty, not saved.")
+			return
+		# Avoid duplicates (case-insensitive)
+		if any(page.lower() == p.lower() for p in self.saved_pages):
+			self.log_fn(f"Page name already saved: {page}")
+			return
+		self.saved_pages.append(page)
+		cfg = self.get_config_fn()
+		cfg["saved_pages"] = self.saved_pages
+		save_config(cfg)
+		self.log_fn(f"Saved page name: {page}")
+		self._refresh_saved_pages_dropdown(select_page=page)
+
+	def _refresh_saved_pages_dropdown(self, select_page: str = None):
+		self.saved_pages_dropdown.blockSignals(True)
+		self.saved_pages_dropdown.clear()
+		self.saved_pages_dropdown.addItem("Select saved page...")
+		for page in self.saved_pages:
+			self.saved_pages_dropdown.addItem(page)
+		self.saved_pages_dropdown.blockSignals(False)
+		if select_page:
+			idx = self.saved_pages_dropdown.findText(select_page, Qt.MatchFixedString)
+			if idx != -1:
+				self.saved_pages_dropdown.setCurrentIndex(idx)
+
+	def _on_saved_page_selected(self, idx):
+		if idx <= 0:
+			return
+		page = self.saved_pages_dropdown.currentText()
+		if page:
+			self.page_input.setText(page)
+			self.log_fn(f"Selected saved page: {page}")
+
 
 	def _create_adbkeyboard_request(self, serial: str) -> ADBKeyboardRequest:
 		"""Create and emit an ADBKeyboard installation request.
@@ -164,7 +211,7 @@ class ReelsPosterPage(QWidget):
 		top_controls_layout.setSpacing(8)
 		top_controls_layout.setContentsMargins(10, 10, 10, 10)
 
-		# Page input on its own row
+		# Page input row with Save button and dropdown
 		page_row = QHBoxLayout()
 		page_row.setSpacing(8)
 		page_label = QLabel("Page")
@@ -175,6 +222,19 @@ class ReelsPosterPage(QWidget):
 		self.page_input.setMinimumWidth(220)
 		self.page_input.textChanged.connect(self._validate_start_button)
 		page_row.addWidget(self.page_input)
+
+		self.save_page_btn = QPushButton("Save")
+		self.save_page_btn.setFixedWidth(60)
+		self.save_page_btn.setToolTip("Save page name")
+		self.save_page_btn.clicked.connect(self._save_current_page)
+		page_row.addWidget(self.save_page_btn)
+
+		self.saved_pages_dropdown = QComboBox()
+		self.saved_pages_dropdown.setMinimumWidth(180)
+		self.saved_pages_dropdown.setMaximumWidth(220)
+		self.saved_pages_dropdown.currentIndexChanged.connect(self._on_saved_page_selected)
+		page_row.addWidget(self.saved_pages_dropdown)
+
 		page_row.addStretch()
 		top_controls_layout.addLayout(page_row)
 

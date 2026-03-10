@@ -1,18 +1,18 @@
 import sys
-from pathlib import Path
+from src.utils.resource_path import resource_path
 
 from PySide6.QtWidgets import QApplication
 
 from src.ui.main_window import MainWindow
 
 
-def _load_stylesheet() -> str:
-    """Load global QSS from ui/style.qss (returns empty string if missing)."""
-    style_path = Path(__file__).resolve().parent / "ui" / "style.qss"
+def apply_theme(app):
+    qss_path = resource_path("assets/styles/dark_theme.qss")
     try:
-        return style_path.read_text(encoding="utf-8")
-    except OSError:
-        return ""
+        with open(qss_path, "r", encoding="utf-8") as f:
+            app.setStyleSheet(f.read())
+    except Exception:
+        pass
 
 
 def main():
@@ -25,7 +25,7 @@ def main():
     try:
         app = QApplication(sys.argv)
         app.setApplicationName("LD Automation Tool")
-        app.setStyleSheet(_load_stylesheet())
+        apply_theme(app)
 
         window = MainWindow()
         window.show()

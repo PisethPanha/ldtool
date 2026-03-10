@@ -5,6 +5,8 @@ from PySide6.QtWidgets import (
     QDockWidget,
     QLabel,
 )
+from PySide6.QtGui import QIcon
+from src.utils.resource_path import resource_path
 
 from src.core.config import load_config
 from src.core.models import AppState
@@ -40,9 +42,10 @@ class MainWindow(QMainWindow):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("LDTool")
+        self.setWindowTitle("AutoLynx")
+        self.setWindowIcon(QIcon(resource_path("assets/icons/ldtool.ico")))
         self.resize(1100, 650)
-        self.setMinimumSize(900, 950)
+        self.setMinimumSize(1500, 950)
 
         # Initialize app state and managers
         self.state = AppState.instance()

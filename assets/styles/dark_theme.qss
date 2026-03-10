@@ -1,0 +1,42 @@
+/* Example dark theme QSS for LDTool */
+QWidget {
+    background-color: #1e1e1e;
+    color: #d4d4d4;
+}
+QPushButton {
+    background-color: #252526;
+    color: #cccccc;
+    border: 1px solid #3c3c3c;
+    padding: 8px 15px;
+    border-radius: 10px;
+}
+QTabWidget::pane {
+    background: #2d2d2d;
+}
+QTabBar::tab {
+    background: #2d2d2d;
+    color: #cccccc;
+    border: 1px solid #3c3c3c;
+    padding: 6px;
+}
+QTabBar::tab:selected {
+    background: #1e1e1e;
+    color: #ffffff;
+}
+QDockWidget {
+    background: #333333;
+    color: #cccccc;
+}
+QScrollBar {
+    background: #1e1e1e;
+}
+QScrollBar::handle {
+    background: #555555;
+}
+
+    QGroupBox {
+        border: 2px solid purple;
+        border-radius: 10px;
+        margin-top: 10px;
+        padding: 15px;
+    }
