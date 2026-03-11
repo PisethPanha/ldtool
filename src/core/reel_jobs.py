@@ -30,6 +30,7 @@ class ReelJob:
 	ai_caption_cache: dict | None = None
 	have_subfolder: bool = False
 	subfolder_name: str = ""
+	additional_hashtags: str | None = None
 
 
 class ReelJobQueue:
@@ -150,6 +151,13 @@ class ReelJobQueue:
 							else None
 						),
 						label=int(item.get("label", 0) or 0),
+						have_subfolder=bool(item.get("have_subfolder", False)),
+						subfolder_name=str(item.get("subfolder_name", "")),
+						use_smart_title=bool(item.get("use_smart_title", False)),
+						use_ai_retitle=bool(item.get("use_ai_retitle", False)),
+						ai_target_language=str(item.get("ai_target_language", "English")),
+						ai_caption_cache=item.get("ai_caption_cache", None),
+						additional_hashtags=item.get("additional_hashtags", None),
 					)
 				)
 

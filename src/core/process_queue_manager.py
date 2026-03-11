@@ -1,5 +1,7 @@
 """Core Process Queue Manager - Business logic for queue management.
 
+from PySide6.QtCore import QObject, Signal
+
 This manager handles:
 - Queue storage and ordering
 - Instance locking (per-instance serialization)
@@ -17,6 +19,8 @@ from datetime import datetime
 from typing import Any, Callable
 import uuid
 import logging
+
+from PySide6.QtCore import QObject, Signal
 
 from src.core.reel_jobs import ReelJob
 
@@ -45,7 +49,7 @@ class ProcessSnapshot:
 	finished_at: datetime | None = None
 
 
-class ProcessQueueManager:
+class ProcessQueueManager(QObject):
 	"""Core queue manager with per-instance locking.
 	
 	Guarantees:
@@ -55,7 +59,14 @@ class ProcessQueueManager:
 	- Scheduled processes wait until scheduled time + instance free
 	"""
 
+	process_queued = Signal(object)
+	process_started = Signal(object)
+	process_completed = Signal(str, int, int)
+	process_failed = Signal(str, str)
+	status_changed = Signal(str, str)
+
 	def __init__(self, log_fn: Callable[[str], None] | None = None):
+		super().__init__()
 		"""Initialize queue manager.
 		
 		Args:
@@ -68,12 +79,7 @@ class ProcessQueueManager:
 		self.running: dict[str, str] = {}  # instance_name -> process_id
 		self.registry: dict[str, ProcessSnapshot] = {}  # process_id -> snapshot
 		
-		# Callbacks for UI notification
-		self.on_process_queued: Callable[[ProcessSnapshot], None] | None = None
-		self.on_process_started: Callable[[ProcessSnapshot], None] | None = None
-		self.on_process_completed: Callable[[str, int, int], None] | None = None
-		self.on_process_failed: Callable[[str, str], None] | None = None
-		self.on_status_changed: Callable[[str, str], None] | None = None
+		# Qt signals for UI notification
 
 	def enqueue(self, process: ProcessSnapshot) -> None:
 		"""Add process to queue.
@@ -89,19 +95,9 @@ class ProcessQueueManager:
 		self._log(f"        Media: {len(process.jobs)}, Mode: {process.post_mode}")
 		self._log(f"        Queue depth: {len(self.queue)}, Running: {len(self.running)}")
 		self._log(f"        Running instances: {list(self.running.keys())}")
-		self._log(f"[Queue] on_process_queued callback: {self.on_process_queued}")
+		self._log("[Queue] emitting process_queued signal")
 		
-		if self.on_process_queued:
-			try:
-				self._log(f"[Queue] Invoking on_process_queued callback...")
-				self.on_process_queued(process)
-				self._log(f"[Queue] ✓ on_process_queued callback completed")
-			except Exception as e:
-				self._log(f"[Queue] ✗ ERROR in on_process_queued: {type(e).__name__}: {e}")
-				import traceback
-				self._log(f"[Queue] Traceback: {traceback.format_exc()}")
-		else:
-			self._log(f"[Queue] ✗ on_process_queued callback is NOT set!")
+		self.process_queued.emit(process)
 		
 		# Try to start immediately if instance is free
 		self._log(f"[Queue] Calling try_start_next() for process {process.process_id[:8]}")
@@ -170,29 +166,9 @@ class ProcessQueueManager:
 		self._log(f"        Instance '{process.instance_name}' is now LOCKED")
 		self._log(f"        Running processes: {list(self.running.keys())}")
 		
-		if self.on_process_started:
-			try:
-				self._log(f"[Queue] Invoking on_process_started callback...")
-				self.on_process_started(process)
-				self._log(f"[Queue] ✓ on_process_started callback completed")
-			except Exception as e:
-				self._log(f"[Queue] ✗ ERROR in on_process_started: {type(e).__name__}: {e}")
-				import traceback
-				self._log(f"[Queue] Traceback: {traceback.format_exc()}")
-		else:
-			self._log(f"[Queue] ✗ on_process_started callback is NOT set!")
+		self.process_started.emit(process)
 		
-		if self.on_status_changed:
-			try:
-				self._log(f"[Queue] Invoking on_status_changed callback with status='running'...")
-				self.on_status_changed(process.process_id, "running")
-				self._log(f"[Queue] ✓ on_status_changed callback completed")
-			except Exception as e:
-				self._log(f"[Queue] ✗ ERROR in on_status_changed: {type(e).__name__}: {e}")
-				import traceback
-				self._log(f"[Queue] Traceback: {traceback.format_exc()}")
-		else:
-			self._log(f"[Queue] ✗ on_status_changed callback is NOT set!")
+		self.status_changed.emit(process.process_id, "running")
 
 	def mark_completed(self, process_id: str, success: int, fail: int) -> None:
 		"""Mark process as completed and free instance.
@@ -216,29 +192,9 @@ class ProcessQueueManager:
 		self._log(f"        Results: {success} success, {fail} failed")
 		self._log(f"        Running processes: {list(self.running.keys())}")
 		
-		if self.on_process_completed:
-			try:
-				self._log(f"[Queue] Invoking on_process_completed callback...")
-				self.on_process_completed(process_id, success, fail)
-				self._log(f"[Queue] ✓ on_process_completed callback completed")
-			except Exception as e:
-				self._log(f"[Queue] ✗ ERROR in on_process_completed: {type(e).__name__}: {e}")
-				import traceback
-				self._log(f"[Queue] Traceback: {traceback.format_exc()}")
-		else:
-			self._log(f"[Queue] ✗ on_process_completed callback is NOT set!")
+		self.process_completed.emit(process_id, success, fail)
 		
-		if self.on_status_changed:
-			try:
-				self._log(f"[Queue] Invoking on_status_changed callback with status='completed'...")
-				self.on_status_changed(process_id, "completed")
-				self._log(f"[Queue] ✓ on_status_changed callback completed")
-			except Exception as e:
-				self._log(f"[Queue] ✗ ERROR in on_status_changed: {type(e).__name__}: {e}")
-				import traceback
-				self._log(f"[Queue] Traceback: {traceback.format_exc()}")
-		else:
-			self._log(f"[Queue] ✗ on_status_changed callback is NOT set!")
+		self.status_changed.emit(process_id, "completed")
 		
 		# Try to start next process
 		self._log(f"[Queue] Calling try_start_next() after completion")
@@ -265,29 +221,8 @@ class ProcessQueueManager:
 		self._log(f"        Error: {error}")
 		self._log(f"        Running processes: {list(self.running.keys())}")
 		
-		if self.on_process_failed:
-			try:
-				self._log(f"[Queue] Invoking on_process_failed callback...")
-				self.on_process_failed(process_id, error)
-				self._log(f"[Queue] ✓ on_process_failed callback completed")
-			except Exception as e:
-				self._log(f"[Queue] ✗ ERROR in on_process_failed: {type(e).__name__}: {e}")
-				import traceback
-				self._log(f"[Queue] Traceback: {traceback.format_exc()}")
-		else:
-			self._log(f"[Queue] ✗ on_process_failed callback is NOT set!")
-		
-		if self.on_status_changed:
-			try:
-				self._log(f"[Queue] Invoking on_status_changed callback with status='failed'...")
-				self.on_status_changed(process_id, "failed")
-				self._log(f"[Queue] ✓ on_status_changed callback completed")
-			except Exception as e:
-				self._log(f"[Queue] ✗ ERROR in on_status_changed: {type(e).__name__}: {e}")
-				import traceback
-				self._log(f"[Queue] Traceback: {traceback.format_exc()}")
-		else:
-			self._log(f"[Queue] ✗ on_status_changed callback is NOT set!")
+		self.process_failed.emit(process_id, error)
+		self.status_changed.emit(process_id, "failed")
 		
 		# Try to start next process
 		self._log(f"[Queue] Calling try_start_next() after failure")

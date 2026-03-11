@@ -9,7 +9,7 @@ from typing import Any, Callable
 import time
 import uuid
 
-from PySide6.QtCore import Qt, QDateTime, QThread
+from PySide6.QtCore import Qt, QDateTime, QThread, QTimer
 from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (
 	QWidget,
@@ -59,18 +59,6 @@ from src.ui.widgets import SectionTitle, icon_path
 
 
 class ReelsPosterPage(QWidget):
-	"""UI for building and running reel posting jobs."""
-
-	# Queue table column indices
-	COL_Q_INSTANCE = 0
-	COL_Q_PAGE = 1
-	COL_Q_MEDIA = 2
-	COL_Q_MODE = 3
-	COL_Q_SCHEDULE = 4
-	COL_Q_STATUS = 5
-	COL_Q_PROGRESS = 6
-	COL_Q_RESULT = 7
-
 	def __init__(
 		self,
 		log_fn: Callable[[str], None],
@@ -109,19 +97,42 @@ class ReelsPosterPage(QWidget):
 		self.queue_manager = ProcessQueueManager(log_fn=self.log_fn)
 		self.log_fn("[INIT] ProcessQueueManager created")
 
-		# Register callbacks (not Qt signals)
-		self.queue_manager.on_process_queued = self._on_queue_process_queued
-		self.queue_manager.on_process_started = self._on_queue_process_started
-		self.queue_manager.on_process_completed = self._on_queue_process_completed
-		self.queue_manager.on_process_failed = self._on_queue_process_failed
-		self.queue_manager.on_status_changed = self._on_queue_status_changed
-		self.log_fn("[INIT] ✓ All queue_manager callbacks registered")
+		# Register Qt signal callbacks for UI updates
+		self.queue_manager.process_queued.connect(self._on_queue_process_queued)
+		self.queue_manager.process_started.connect(self._on_queue_process_started)
+		self.queue_manager.process_completed.connect(self._on_queue_process_completed)
+		self.queue_manager.process_failed.connect(self._on_queue_process_failed)
+		self.queue_manager.status_changed.connect(self._on_queue_status_changed)
+		self.log_fn("[INIT] ✓ All queue_manager signals connected (UI thread safe)")
+
+		# Scheduler timer for scheduled jobs (periodic queue check)
+		self._queue_timer = QTimer(self)
+		self._queue_timer.timeout.connect(self._check_queue)
+		self._queue_timer.start(5000)  # check every 5 seconds
 
 		# Saved pages feature
 		self.saved_pages: list[str] = []
 		self._build_ui()
 		self._load_saved_pages()
 		self._load_ai_settings()
+
+	def _check_queue(self):
+		if self._is_closing:
+			return
+		self.queue_manager.try_start_next()
+
+	# ------------------------------------------------------------------
+	# UI for building and running reel posting jobs."""
+
+	# Queue table column indices
+	COL_Q_INSTANCE = 0
+	COL_Q_PAGE = 1
+	COL_Q_MEDIA = 2
+	COL_Q_MODE = 3
+	COL_Q_SCHEDULE = 4
+	COL_Q_STATUS = 5
+	COL_Q_PROGRESS = 6
+	COL_Q_RESULT = 7
 
 	def _load_saved_pages(self):
 		cfg = self.get_config_fn()
@@ -165,7 +176,6 @@ class ReelsPosterPage(QWidget):
 		if page:
 			self.page_input.setText(page)
 			self.log_fn(f"Selected saved page: {page}")
-
 
 	def _create_adbkeyboard_request(self, serial: str) -> ADBKeyboardRequest:
 		"""Create and emit an ADBKeyboard installation request.
@@ -631,17 +641,17 @@ class ReelsPosterPage(QWidget):
 	def closeEvent(self, event) -> None:  # type: ignore[override]
 		self._is_closing = True
 		self.stop_event.set()
-		
+		# Stop periodic queue timer
+		if hasattr(self, '_queue_timer'):
+			self._queue_timer.stop()
 		# Clean up all active workers and threads
 		for process_id, worker in list(self._workers_by_pid.items()):
 			if worker is not None:
 				worker.cancel()
-		
 		for process_id, thread in list(self._threads_by_pid.items()):
 			if thread is not None and thread.isRunning():
 				thread.quit()
 				thread.wait()
-		
 		super().closeEvent(event)
 
 	# ------------------------------------------------------------------
@@ -746,7 +756,7 @@ class ReelsPosterPage(QWidget):
 			self.schedule_warning.show()
 		elif (scheduled - now).total_seconds() < 25 * 60:
 			self.schedule_warning.setText(
-				"\u26A0 Scheduled time is less than 25 minutes from now."
+				"\u26A0 Scheduled time is for future"
 			)
 			self.schedule_warning.show()
 		else:
@@ -857,123 +867,118 @@ class ReelsPosterPage(QWidget):
 		self._log("[START] _start() method called")
 		self._log(f"[START] Queue manager exists: {self.queue_manager is not None}")
 		if self.queue_manager:
-			self._log(f"[START] Queue manager callbacks:")
-			self._log(f"[START]   - on_process_queued: {self.queue_manager.on_process_queued is not None}")
-			self._log(f"[START]   - on_process_started: {self.queue_manager.on_process_started is not None}")
-			self._log(f"[START]   - on_process_completed: {self.queue_manager.on_process_completed is not None}")
-			self._log(f"[START]   - on_process_failed: {self.queue_manager.on_process_failed is not None}")
-			self._log(f"[START]   - on_status_changed: {self.queue_manager.on_status_changed is not None}")
-		
-		# Validate AI settings if enabled
-		if self.ai_retitle_checkbox.isChecked():
-			api_key = self.gemini_api_key_edit.text().strip()
-			if not api_key:
-				self._toast.show_error("AI retitle enabled but no API key provided")
-				self.log_fn("✗ Cannot start: AI enabled but Gemini API key is missing")
-				return
+			self._log("[START] Queue manager signals available: process_queued, process_started, process_completed, process_failed, status_changed")
 			
-			# Test if Gemini service can be initialized
-			self.log_fn("Validating Gemini API configuration...")
-			test_service = AICaptionService(api_key, self.log_fn)
-			is_ready, init_error = test_service.is_ready()
+			# Validate AI settings if enabled
+			if self.ai_retitle_checkbox.isChecked():
+				api_key = self.gemini_api_key_edit.text().strip()
+				if not api_key:
+					self._toast.show_error("AI retitle enabled but no API key provided")
+					self.log_fn("✗ Cannot start: AI enabled but Gemini API key is missing")
+					return
+				
+				# Test if Gemini service can be initialized
+				self.log_fn("Validating Gemini API configuration...")
+				test_service = AICaptionService(api_key, self.log_fn)
+				is_ready, init_error = test_service.is_ready()
+				
+				if not is_ready:
+					self._toast.show_error(f"Gemini initialization failed: {init_error}")
+					self.log_fn(f"✗ Cannot start: Gemini init failed - {init_error}")
+					self.log_fn("   You can either:")
+					self.log_fn("   1. Fix the API key and try again")
+					self.log_fn("   2. Uncheck 'Retitle by AI' to proceed without AI")
+					return
+				else:
+					self.log_fn("✓ Gemini API configuration validated successfully")
 			
-			if not is_ready:
-				self._toast.show_error(f"Gemini initialization failed: {init_error}")
-				self.log_fn(f"✗ Cannot start: Gemini init failed - {init_error}")
-				self.log_fn("   You can either:")
-				self.log_fn("   1. Fix the API key and try again")
-				self.log_fn("   2. Uncheck 'Retitle by AI' to proceed without AI")
-				return
-			else:
-				self.log_fn("✓ Gemini API configuration validated successfully")
-		
-		# Validate subfolder if enabled
-		if self.use_subfolder_checkbox.isChecked():
-			subfolder = self.subfolder_name_input.text().strip()
-			if not subfolder:
-				self._toast.show_error("Please enter a sub folder name.")
-				self.log_fn("✗ Cannot start: Subfolder enabled but no folder name provided")
-				return
+			# Validate subfolder if enabled
+			if self.use_subfolder_checkbox.isChecked():
+				subfolder = self.subfolder_name_input.text().strip()
+				if not subfolder:
+					self._toast.show_error("Please enter a sub folder name.")
+					self.log_fn("✗ Cannot start: Subfolder enabled but no folder name provided")
+					return
 
-		payload = self._build_run_payload(test_mode=False)
-		if payload is None:
-			self._log("[START] ✗ _build_run_payload returned None, aborting")
-			return
-		
-		# Use queue manager for multi-media posts
-		jobs = payload["jobs"]
-		instances = payload["instances"]
-		
-		self._log(f"[START] ===== _start() called =====")
-		self._log(f"[START] Number of jobs: {len(jobs)}, Number of instances: {len(instances)}")
-		self._log(f"[START] Payload keys: {list(payload.keys())}")
-		
-		if not jobs or not instances:
-			self._log(f"[START] ✗ Invalid payload: jobs={len(jobs)}, instances={len(instances)}")
-			return
-		
-		# ALL posts go through queue manager (single OR multi-media)
-		self._log(f"[START] ✓ Queueing process ({len(jobs)} job(s))")
-		
-		# Create process snapshot and add to queue
-		selected_instance = instances[0]
-		instance_serial = getattr(selected_instance, "adb_serial", "")
-		instance_name = getattr(selected_instance, "name", instance_serial or "Unknown")
-		post_mode = jobs[0].post_mode if jobs else "NOW"
-		scheduled_at = jobs[0].scheduled_at if jobs else None
-		page_name = jobs[0].target_page if jobs else ""
-		
-		self._log(f"[START] Process details:")
-		self._log(f"        instance_name='{instance_name}'")
-		self._log(f"        instance_serial='{instance_serial}'")
-		self._log(f"        selected_instance.name='{getattr(selected_instance, 'name', 'N/A')}'")
-		self._log(f"        Jobs: {len(jobs)}, Mode: {post_mode}")
-		
-		# Check if instance is already busy
-		is_busy = self.queue_manager.is_instance_busy(instance_name)
-		self._log(f"[START] Instance '{instance_name}' busy check: {is_busy}")
-		if is_busy:
-			self._log(f"[START] Instance is locked, process will queue")
-		else:
-			self._log(f"[START] Instance is free, process will start immediately")
-		
-		# Create immutable process snapshot
-		process = ProcessSnapshot(
-			process_id=str(uuid.uuid4()),
-			instance_name=instance_name,
-			instance_serial=instance_serial,
-			page_name=page_name,
-			jobs=jobs,
-			post_mode=post_mode,
-			scheduled_at=scheduled_at,
-			have_subfolder=self.use_subfolder_checkbox.isChecked(),
-			subfolder_name=self.subfolder_name_input.text().strip()
-		)
-		
-		self._log(f"[START] ProcessSnapshot created with ID: {process.process_id[:8]}")
-		
-		# Register this process in status tracking
-		self._process_status[process.process_id] = "queued"
-		
-		# Add to queue manager
-		self._log(f"[START] Calling queue_manager.enqueue()")
-		self.queue_manager.enqueue(process)
-		
-		# Log summary
-		mode_str = "Immediate"
-		if post_mode == "SCHEDULED" and scheduled_at:
-			mode_str = f"Scheduled ({scheduled_at.strftime('%H:%M')})"
-		
-		self._log(f"[START] Process {process.process_id[:8]} queued: {len(jobs)} {'media' if len(jobs) > 1 else 'file'} for {instance_name}, mode={mode_str}")
-		
-		# Clear inputs AFTER snapshot is created
-		self._clear_inputs()
-		
-		# Toast feedback
-		self._toast.show_message(
-			f"\u2713 Process added to queue\n"
-			f"Instance: {instance_name}\n"
-			f"Media: {len(jobs)} {'files' if len(jobs) > 1 else 'file'}  \u2022  Mode: {mode_str}"
+			payload = self._build_run_payload(test_mode=False)
+			if payload is None:
+				self._log("[START] ✗ _build_run_payload returned None, aborting")
+				return
+			
+			# Use queue manager for multi-media posts
+			jobs = payload["jobs"]
+			instances = payload["instances"]
+			
+			self._log(f"[START] ===== _start() called =====")
+			self._log(f"[START] Number of jobs: {len(jobs)}, Number of instances: {len(instances)}")
+			self._log(f"[START] Payload keys: {list(payload.keys())}")
+			
+			if not jobs or not instances:
+				self._log(f"[START] ✗ Invalid payload: jobs={len(jobs)}, instances={len(instances)}")
+				return
+			
+			# ALL posts go through queue manager (single OR multi-media)
+			self._log(f"[START] ✓ Queueing process ({len(jobs)} job(s))")
+			
+			# Create process snapshot and add to queue
+			selected_instance = instances[0]
+			instance_serial = getattr(selected_instance, "adb_serial", "")
+			instance_name = getattr(selected_instance, "name", instance_serial or "Unknown")
+			post_mode = jobs[0].post_mode if jobs else "NOW"
+			scheduled_at = jobs[0].scheduled_at if jobs else None
+			page_name = jobs[0].target_page if jobs else ""
+			
+			self._log(f"[START] Process details:")
+			self._log(f"        instance_name='{instance_name}'")
+			self._log(f"        instance_serial='{instance_serial}'")
+			self._log(f"        selected_instance.name='{getattr(selected_instance, 'name', 'N/A')}'")
+			self._log(f"        Jobs: {len(jobs)}, Mode: {post_mode}")
+			
+			# Check if instance is already busy
+			is_busy = self.queue_manager.is_instance_busy(instance_name)
+			self._log(f"[START] Instance '{instance_name}' busy check: {is_busy}")
+			if is_busy:
+				self._log(f"[START] Instance is locked, process will queue")
+			else:
+				self._log(f"[START] Instance is free, process will start immediately")
+			
+			# Create immutable process snapshot
+			process = ProcessSnapshot(
+				process_id=str(uuid.uuid4()),
+				instance_name=instance_name,
+				instance_serial=instance_serial,
+				page_name=page_name,
+				jobs=jobs,
+				post_mode=post_mode,
+				scheduled_at=scheduled_at,
+				have_subfolder=self.use_subfolder_checkbox.isChecked(),
+				subfolder_name=self.subfolder_name_input.text().strip()
+			)
+			
+			self._log(f"[START] ProcessSnapshot created with ID: {process.process_id[:8]}")
+			
+			# Register this process in status tracking
+			self._process_status[process.process_id] = "queued"
+			
+			# Add to queue manager
+			self._log(f"[START] Calling queue_manager.enqueue()")
+			self.queue_manager.enqueue(process)
+			
+			# Log summary
+			mode_str = "Immediate"
+			if post_mode == "SCHEDULED" and scheduled_at:
+				mode_str = f"Scheduled ({scheduled_at.strftime('%H:%M')})"
+			
+			self._log(f"[START] Process {process.process_id[:8]} queued: {len(jobs)} {'media' if len(jobs) > 1 else 'file'} for {instance_name}, mode={mode_str}")
+			
+			# Clear inputs AFTER snapshot is created
+			self._clear_inputs()
+			
+			# Toast feedback
+			self._toast.show_message(
+				f"\u2713 Process added to queue\n"
+				f"Instance: {instance_name}\n"
+				f"Media: {len(jobs)} {'files' if len(jobs) > 1 else 'file'}  \u2022  Mode: {mode_str}"
 			)
 
 	def _test(self) -> None:
@@ -1118,13 +1123,13 @@ class ReelsPosterPage(QWidget):
 		# Start thread
 		thread.start()
 		self._log(f"[WORKER-START] ✓ Thread started for process {process_id[:8]}")
-	
+
 	def _on_multi_worker_log(self, message: str) -> None:
 		"""Handle log message from multi-media worker."""
 		if self._is_closing:
 			return
 		self._log(message)
-	
+
 	def _on_multi_worker_progress(self, idx: int, total: int, media_name: str, status: str, process_id: str = "") -> None:
 		"""Handle progress update from multi-media worker."""
 		if self._is_closing:
@@ -1147,7 +1152,7 @@ class ReelsPosterPage(QWidget):
 		"""
 		if self._is_closing:
 			return
-		
+			
 		self._log(f"[WORKER-FINISH] ===== _on_multi_worker_finished callback =====")
 		self._log(f"[WORKER-FINISH] Process ID: {process_id[:8]}")
 		self._log(f"[WORKER-FINISH] Instance serial: {instance_serial}")
@@ -1210,7 +1215,7 @@ class ReelsPosterPage(QWidget):
 		self._media_paths.clear()
 		self._update_media_counter()
 		# Keep page input for convenience
-	
+
 	def _clear_completed_processes(self) -> None:
 		"""Remove completed/failed processes from queue table."""
 		rows_to_remove = []
@@ -1243,7 +1248,7 @@ class ReelsPosterPage(QWidget):
 		
 		self.queue_manager.clear_completed()
 		self._update_empty_states()
-	
+
 	# ------------------------------------------------------------------
 	# Queue manager callbacks
 	# ------------------------------------------------------------------
@@ -1251,7 +1256,7 @@ class ReelsPosterPage(QWidget):
 		"""Handle process queued - add row to queue table."""
 		if self._is_closing:
 			return
-		
+			
 		# Add row to queue table
 		row = self.queue_table.rowCount()
 		self.queue_table.insertRow(row)
@@ -1291,12 +1296,12 @@ class ReelsPosterPage(QWidget):
 		self.queue_table.setItem(row, self.COL_Q_RESULT, QTableWidgetItem(""))
 		
 		self._update_empty_states()
-	
+
 	def _on_queue_status_changed(self, process_id: str, status: str) -> None:
 		"""Handle process status change with color coding."""
 		if self._is_closing:
 			return
-		
+			
 		# Update internal tracking
 		self._process_status[process_id] = status
 		
@@ -1308,7 +1313,7 @@ class ReelsPosterPage(QWidget):
 				status_item.setForeground(QColor(color))
 				self.queue_table.setItem(row, self.COL_Q_STATUS, status_item)
 				break
-	
+
 	def _on_queue_process_started(self, process: ProcessSnapshot) -> None:
 		"""Handle process started from queue.
 		
@@ -1317,7 +1322,7 @@ class ReelsPosterPage(QWidget):
 		"""
 		if self._is_closing:
 			return
-		
+			
 		self._log(f"[WORKER] ===== _on_queue_process_started callback =====")
 		self._log(f"[WORKER] Process: {process.process_id[:8]}")
 		self._log(f"[WORKER] Instance: {process.instance_name} (serial={process.instance_serial})")
@@ -1332,7 +1337,7 @@ class ReelsPosterPage(QWidget):
 			self._log(f"[WORKER] Available instances: {[(inst.name, inst.adb_serial) for inst in state.instances]}")
 			self.queue_manager.mark_failed(process.process_id, f"Instance {process.instance_serial} not found")
 			return
-		
+			
 		self._log(f"[WORKER] ✓ Found instance: {instances[0].name} ({instances[0].adb_serial})")
 		
 		# Start the worker for this process
@@ -1354,7 +1359,7 @@ class ReelsPosterPage(QWidget):
 			return
 		self._log(f"Queue process {process_id[:8]} completed: {success_count} success, {fail_count} failed")
 		self._update_queue_result(process_id, f"\u2713 {success_count}  \u2717 {fail_count}")
-	
+
 	def _on_queue_process_failed(self, process_id: str, error: str) -> None:
 		"""Handle process failure from queue."""
 		if self._is_closing:
@@ -1412,13 +1417,17 @@ class ReelsPosterPage(QWidget):
 			# Get caption and label from mapper
 			caption = self._caption_mapper.get_caption(media_path)
 			label = self._caption_mapper.get_label(media_path)
-			
+
 			# Fallback to filename if not in mapper
 			if caption is None:
 				caption = caption_from_filename(media_path)
 			if label is None:
 				label = 0
-			
+
+			additional_hashtags = None
+			if hasattr(self, "additional_hashtag_checkbox") and self.additional_hashtag_checkbox.isChecked():
+				additional_hashtags = self.additional_hashtag_input.text().strip()
+
 			jobs.append(
 				ReelJob(
 					id=str(uuid.uuid4()),
@@ -1436,11 +1445,12 @@ class ReelsPosterPage(QWidget):
 					use_ai_retitle=self.ai_retitle_checkbox.isChecked(),
 					ai_target_language=self.ai_language_combo.currentText(),
 					ai_caption_cache=None,
-				have_subfolder=self.use_subfolder_checkbox.isChecked(),
-				subfolder_name=self.subfolder_name_input.text().strip(),
+					have_subfolder=self.use_subfolder_checkbox.isChecked(),
+					subfolder_name=self.subfolder_name_input.text().strip(),
+					additional_hashtags=additional_hashtags,
 				)
 			)
-		
+
 		# Sort jobs by label to ensure ordered posting
 		jobs.sort(key=lambda j: j.label)
 
@@ -1580,8 +1590,8 @@ class ReelsPosterPage(QWidget):
 									f"(move to failed/ also failed: {exc})"
 								)
 
-		if self.stop_event.is_set():
-			log_fn and log_fn("Reels posting stopped by user.")
+			if self.stop_event.is_set():
+				log_fn and log_fn("Reels posting stopped by user.")
 
 		return {
 			"type": "run",

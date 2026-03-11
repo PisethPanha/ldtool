@@ -313,6 +313,15 @@ def resolve_emulator_media_path(adb: Any, serial: str, filename: str) -> Optiona
 
 
 class ReelPoster:
+	@staticmethod
+	def normalize_hashtags(text: str) -> str:
+			parts = text.split()
+			tags = []
+			for p in parts:
+				if not p.startswith("#"):
+					p = "#" + p
+				tags.append(p)
+			return " ".join(tags)
 	"""
 	State machine for Facebook reel posting following real UI flow.
 	"""
@@ -2150,7 +2159,15 @@ class ReelPoster:
 		
 		title = caption_to_use.get("title", filename_stem)
 		description = caption_to_use.get("description", title)
-		
+
+		# Additional Hashtag logic
+		if hasattr(job, 'additional_hashtags') and job.additional_hashtags:
+			tags = ReelPoster.normalize_hashtags(job.additional_hashtags)
+			description = f"{description} {tags}".strip()
+			self._log(f"Additional hashtags applied: {tags}")
+		else:
+			self._log("Additional hashtags disabled")
+
 		return self._helper_fill_caption(serial, title, timeout_s, description=description)
 
 	def _state_configure_schedule(
