@@ -1149,13 +1149,13 @@ class ReelsPosterPage(QWidget):
 		"""Handle progress update from multi-media worker."""
 		if self._is_closing:
 			return
-		# Update queue table progress bar
+		from PySide6.QtCore import QTimer
 		if process_id:
 			bar = self._queue_progress_bars.get(process_id)
 			if bar:
-				bar.setMaximum(total)
-				bar.setValue(idx)
-				bar.setFormat(f"{idx} / {total} posted")
+				QTimer.singleShot(0, lambda: bar.setMaximum(total))
+				QTimer.singleShot(0, lambda: bar.setValue(idx))
+				QTimer.singleShot(0, lambda: bar.setFormat(f"{idx} / {total} posted"))
 	
 	def _on_multi_worker_finished(self, process_id: str, instance_serial: str, result: dict[str, Any]) -> None:
 		"""Handle completion of multi-media worker.
@@ -1167,38 +1167,28 @@ class ReelsPosterPage(QWidget):
 		"""
 		if self._is_closing:
 			return
-			
+		from PySide6.QtCore import QTimer
 		self._log(f"[WORKER-FINISH] ===== _on_multi_worker_finished callback =====")
 		self._log(f"[WORKER-FINISH] Process ID: {process_id[:8]}")
 		self._log(f"[WORKER-FINISH] Instance serial: {instance_serial}")
 		self._log(f"[WORKER-FINISH] Active workers before cleanup: {list(self._workers_by_pid.keys())}")
-		
 		total = result.get("total", 0)
 		success = result.get("success", 0)
 		fail = result.get("fail", 0)
 		cancelled = result.get("cancelled", False)
-		
 		self._log(f"[WORKER-FINISH] Results: total={total}, success={success}, fail={fail}, cancelled={cancelled}")
-		
-		# Log summary
 		if cancelled:
 			self._log(f"[WORKER-FINISH] Process status: CANCELLED")
 		else:
 			self._log(f"[WORKER-FINISH] Process status: COMPLETED (success={success} fail={fail})")
-		
-		# Update queue result summary column
 		result_text = "Cancelled" if cancelled else f"\u2713 {success}  \u2717 {fail}"
-		self._update_queue_result(process_id, result_text)
-		
-		# Notify queue manager to release lock and try next process
+		QTimer.singleShot(0, lambda: self._update_queue_result(process_id, result_text))
 		self._log(f"[WORKER-FINISH] Notifying queue manager to release lock")
 		if cancelled:
 			self.queue_manager.mark_failed(process_id, "Cancelled by user")
 		else:
 			self.queue_manager.mark_completed(process_id, success, fail)
 		self._log(f"[WORKER-FINISH] Queue manager notified")
-		
-		# Cleanup worker/thread for this process
 		self._log(f"[WORKER-FINISH] Cleaning up worker and thread for {process_id[:8]}")
 		self._running_serials.discard(instance_serial)
 		if process_id in self._workers_by_pid:
@@ -1210,15 +1200,12 @@ class ReelsPosterPage(QWidget):
 			thread.quit()
 			thread.wait()
 			del self._threads_by_pid[process_id]
-		
 		self._log(f"[WORKER-FINISH] Active workers after cleanup: {list(self._workers_by_pid.keys())}")
 		self._log(f"[WORKER-FINISH] ===== Worker cleanup complete for {process_id[:8]} =====")
-		
-		# Re-enable buttons if no processes are running
 		if not self._running_serials:
-			self.start_btn.setEnabled(True)
-			self.test_btn.setEnabled(True)
-			self.stop_btn.setEnabled(False)
+			QTimer.singleShot(0, lambda: self.start_btn.setEnabled(True))
+			QTimer.singleShot(0, lambda: self.test_btn.setEnabled(True))
+			QTimer.singleShot(0, lambda: self.stop_btn.setEnabled(False))
 
 	# ------------------------------------------------------------------
 	# Input clearing and queue management
@@ -1271,63 +1258,54 @@ class ReelsPosterPage(QWidget):
 		"""Handle process queued - add row to queue table."""
 		if self._is_closing:
 			return
-			
-		# Add row to queue table
-		row = self.queue_table.rowCount()
-		self.queue_table.insertRow(row)
-		
-		page = process.page_name
-		media_count = len(process.jobs)
-		mode = "Immediate" if process.scheduled_at is None else "Scheduled"
-		schedule_time = ""
-		if process.scheduled_at:
-			schedule_time = process.scheduled_at.strftime("%Y-%m-%d %H:%M")
-		
-		# Instance (stores process_id as UserRole)
-		inst_item = QTableWidgetItem(process.instance_name)
-		inst_item.setData(Qt.UserRole, process.process_id)
-		self.queue_table.setItem(row, self.COL_Q_INSTANCE, inst_item)
-		self.queue_table.setItem(row, self.COL_Q_PAGE, QTableWidgetItem(page))
-		self.queue_table.setItem(row, self.COL_Q_MEDIA, QTableWidgetItem(str(media_count)))
-		self.queue_table.setItem(row, self.COL_Q_MODE, QTableWidgetItem(mode))
-		self.queue_table.setItem(row, self.COL_Q_SCHEDULE, QTableWidgetItem(schedule_time))
-		
-		# Color-coded status
-		status = "queued"
-		status_item = QTableWidgetItem(status)
-		color = STATUS_COLORS.get(status, "#333")
-		status_item.setForeground(QColor(color))
-		self.queue_table.setItem(row, self.COL_Q_STATUS, status_item)
-		
-		# Progress bar
-		bar = QProgressBar()
-		bar.setRange(0, media_count)
-		bar.setValue(0)
-		bar.setFormat(f"0 / {media_count} posted")
-		self.queue_table.setCellWidget(row, self.COL_Q_PROGRESS, bar)
-		self._queue_progress_bars[process.process_id] = bar
-		
-		# Result column (empty initially)
-		self.queue_table.setItem(row, self.COL_Q_RESULT, QTableWidgetItem(""))
-		
-		self._update_empty_states()
+		from PySide6.QtCore import QTimer
+		def add_row():
+			row = self.queue_table.rowCount()
+			self.queue_table.insertRow(row)
+			page = process.page_name
+			media_count = len(process.jobs)
+			mode = "Immediate" if process.scheduled_at is None else "Scheduled"
+			schedule_time = ""
+			if process.scheduled_at:
+				schedule_time = process.scheduled_at.strftime("%Y-%m-%d %H:%M")
+			inst_item = QTableWidgetItem(process.instance_name)
+			inst_item.setData(Qt.UserRole, process.process_id)
+			self.queue_table.setItem(row, self.COL_Q_INSTANCE, inst_item)
+			self.queue_table.setItem(row, self.COL_Q_PAGE, QTableWidgetItem(page))
+			self.queue_table.setItem(row, self.COL_Q_MEDIA, QTableWidgetItem(str(media_count)))
+			self.queue_table.setItem(row, self.COL_Q_MODE, QTableWidgetItem(mode))
+			self.queue_table.setItem(row, self.COL_Q_SCHEDULE, QTableWidgetItem(schedule_time))
+			status = "queued"
+			status_item = QTableWidgetItem(status)
+			color = STATUS_COLORS.get(status, "#333")
+			status_item.setForeground(QColor(color))
+			self.queue_table.setItem(row, self.COL_Q_STATUS, status_item)
+			bar = QProgressBar()
+			bar.setRange(0, media_count)
+			bar.setValue(0)
+			bar.setFormat(f"0 / {media_count} posted")
+			self.queue_table.setCellWidget(row, self.COL_Q_PROGRESS, bar)
+			self._queue_progress_bars[process.process_id] = bar
+			self.queue_table.setItem(row, self.COL_Q_RESULT, QTableWidgetItem(""))
+			self._update_empty_states()
+		QTimer.singleShot(0, add_row)
 
 	def _on_queue_status_changed(self, process_id: str, status: str) -> None:
 		"""Handle process status change with color coding."""
 		if self._is_closing:
 			return
-			
-		# Update internal tracking
+		from PySide6.QtCore import QTimer
 		self._process_status[process_id] = status
-		
-		for row in range(self.queue_table.rowCount()):
-			item = self.queue_table.item(row, self.COL_Q_INSTANCE)
-			if item and item.data(Qt.UserRole) == process_id:
-				status_item = QTableWidgetItem(status)
-				color = STATUS_COLORS.get(status, "#333")
-				status_item.setForeground(QColor(color))
-				self.queue_table.setItem(row, self.COL_Q_STATUS, status_item)
-				break
+		def update_status():
+			for row in range(self.queue_table.rowCount()):
+				item = self.queue_table.item(row, self.COL_Q_INSTANCE)
+				if item and item.data(Qt.UserRole) == process_id:
+					status_item = QTableWidgetItem(status)
+					color = STATUS_COLORS.get(status, "#333")
+					status_item.setForeground(QColor(color))
+					self.queue_table.setItem(row, self.COL_Q_STATUS, status_item)
+					break
+		QTimer.singleShot(0, update_status)
 
 	def _on_queue_process_started(self, process: ProcessSnapshot) -> None:
 		"""Handle process started from queue.
@@ -1337,58 +1315,54 @@ class ReelsPosterPage(QWidget):
 		"""
 		if self._is_closing:
 			return
-			
+		from PySide6.QtCore import QTimer
 		self._log(f"[WORKER] ===== _on_queue_process_started callback =====")
 		self._log(f"[WORKER] Process: {process.process_id[:8]}")
 		self._log(f"[WORKER] Instance: {process.instance_name} (serial={process.instance_serial})")
 		self._log(f"[WORKER] Starting worker for process")
-		
-		# Look up instance object by serial
 		state = self.get_state_fn()
 		instances = [inst for inst in state.instances if inst.adb_serial == process.instance_serial]
-		
 		if not instances:
 			self._log(f"[WORKER] ✗ ERROR: Could not find instance with serial {process.instance_serial}")
 			self._log(f"[WORKER] Available instances: {[(inst.name, inst.adb_serial) for inst in state.instances]}")
 			self.queue_manager.mark_failed(process.process_id, f"Instance {process.instance_serial} not found")
 			return
-			
 		self._log(f"[WORKER] ✓ Found instance: {instances[0].name} ({instances[0].adb_serial})")
-		
-		# Start the worker for this process
 		self._start_multi_media_worker(
 			process.process_id,
 			process.instance_serial,
 			process.jobs,
-			instances  # Pass found instance(s)
+			instances
 		)
-		
 		self._log(f"[WORKER] Worker thread started for process {process.process_id[:8]}")
-		
-		# Keep Start enabled so user can queue more processes
-		self.stop_btn.setEnabled(True)
+		QTimer.singleShot(0, lambda: self.stop_btn.setEnabled(True))
 		
 	def _on_queue_process_completed(self, process_id: str, success_count: int, fail_count: int) -> None:
 		"""Handle process completion from queue."""
 		if self._is_closing:
 			return
+		from PySide6.QtCore import QTimer
 		self._log(f"Queue process {process_id[:8]} completed: {success_count} success, {fail_count} failed")
-		self._update_queue_result(process_id, f"\u2713 {success_count}  \u2717 {fail_count}")
+		QTimer.singleShot(0, lambda: self._update_queue_result(process_id, f"\u2713 {success_count}  \u2717 {fail_count}"))
 
 	def _on_queue_process_failed(self, process_id: str, error: str) -> None:
 		"""Handle process failure from queue."""
 		if self._is_closing:
 			return
+		from PySide6.QtCore import QTimer
 		self._log(f"Queue process {process_id[:8]} failed: {error}")
-		self._update_queue_result(process_id, f"\u2717 {error}")
+		QTimer.singleShot(0, lambda: self._update_queue_result(process_id, f"\u2717 {error}"))
 
 	def _update_queue_result(self, process_id: str, text: str) -> None:
 		"""Update the Result column for a queue row."""
-		for row in range(self.queue_table.rowCount()):
-			item = self.queue_table.item(row, self.COL_Q_INSTANCE)
-			if item and item.data(Qt.UserRole) == process_id:
-				self.queue_table.setItem(row, self.COL_Q_RESULT, QTableWidgetItem(text))
-				break
+		from PySide6.QtCore import QTimer
+		def update_result():
+			for row in range(self.queue_table.rowCount()):
+				item = self.queue_table.item(row, self.COL_Q_INSTANCE)
+				if item and item.data(Qt.UserRole) == process_id:
+					self.queue_table.setItem(row, self.COL_Q_RESULT, QTableWidgetItem(text))
+					break
+		QTimer.singleShot(0, update_result)
 
 	def _build_run_payload(self, test_mode: bool) -> dict[str, Any] | None:
 		selected_media: list[str] = []
