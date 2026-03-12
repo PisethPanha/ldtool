@@ -378,7 +378,6 @@ class ReelsPosterPage(QWidget):
 		self.gemini_api_key_edit.setEnabled(False)
 		self.gemini_api_key_edit.textChanged.connect(self._on_api_key_changed)
 		ai_row2.addWidget(self.gemini_api_key_edit, 1)
-		
 		self.gemini_test_button = QPushButton("Test API")
 		self.gemini_test_button.setFixedHeight(30)
 		self.gemini_test_button.setFixedWidth(80)
@@ -386,6 +385,22 @@ class ReelsPosterPage(QWidget):
 		self.gemini_test_button.clicked.connect(self._test_gemini_api)
 		ai_row2.addWidget(self.gemini_test_button)
 		ai_controls_layout.addLayout(ai_row2)
+
+		# Additional Hashtag controls (moved below Gemini API key input)
+		additional_hashtag_row = QHBoxLayout()
+		additional_hashtag_row.setSpacing(8)
+		self.additional_hashtag_checkbox = QCheckBox("Additional hashtag")
+		self.additional_hashtag_input = QLineEdit()
+		self.additional_hashtag_input.setPlaceholderText("#viral #reels #funny")
+		self.additional_hashtag_input.setEnabled(False)
+		self.additional_hashtag_checkbox.toggled.connect(
+			lambda checked: self.additional_hashtag_input.setEnabled(checked)
+		)
+		additional_hashtag_row.addWidget(self.additional_hashtag_checkbox)
+		additional_hashtag_row.addWidget(self.additional_hashtag_input, 1)
+		ai_controls_layout.addLayout(additional_hashtag_row)
+
+		
 
 		layout.addWidget(ai_controls)
 
@@ -1447,7 +1462,7 @@ class ReelsPosterPage(QWidget):
 					ai_caption_cache=None,
 					have_subfolder=self.use_subfolder_checkbox.isChecked(),
 					subfolder_name=self.subfolder_name_input.text().strip(),
-					additional_hashtags=additional_hashtags,
+					additional_hashtags=additional_hashtags if additional_hashtags else None,
 				)
 			)
 
@@ -1554,13 +1569,12 @@ class ReelsPosterPage(QWidget):
 						rows[job.id]["status"] = "SUCCESS"
 						rows[job.id]["error"] = ""
 						try:
-							# Move ORIGINAL file to posted/ (not a processing copy)
 							moved_path = move_to_posted(original_media_path)
 							log_fn and log_fn(
 								f"[{instance.adb_serial}] ✓ {Path(job.media_path).name}: SUCCESS "
-								f"(moved to posted/)"
+								f"(moved to posted: {moved_path})"
 							)
-						except Exception as exc:  # pragma: no cover - defensive
+						except Exception as exc:
 							rows[job.id]["status"] = "SUCCESS (move failed)"
 							rows[job.id]["error"] = f"move posted failed: {exc}"
 							log_fn and log_fn(
@@ -1577,13 +1591,12 @@ class ReelsPosterPage(QWidget):
 							)
 						else:
 							try:
-								# Move ORIGINAL file to failed/ (not a processing copy)
-								move_to_failed(original_media_path)
+								moved_path = move_to_failed(original_media_path)
 								log_fn and log_fn(
 									f"[{instance.adb_serial}] ✗ {Path(job.media_path).name}: FAILED - {error} "
-									f"(moved to failed/)"
+									f"(moved to failed: {moved_path})"
 								)
-							except Exception as exc:  # pragma: no cover - defensive
+							except Exception as exc:
 								rows[job.id]["error"] += f" | move failed error: {exc}"
 								log_fn and log_fn(
 									f"[{instance.adb_serial}] ✗ {Path(job.media_path).name}: FAILED - {error} "

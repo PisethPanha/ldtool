@@ -2162,9 +2162,13 @@ class ReelPoster:
 
 		# Additional Hashtag logic
 		if hasattr(job, 'additional_hashtags') and job.additional_hashtags:
-			tags = ReelPoster.normalize_hashtags(job.additional_hashtags)
-			description = f"{description} {tags}".strip()
-			self._log(f"Additional hashtags applied: {tags}")
+			user_hashtags = job.additional_hashtags.strip()
+			if user_hashtags:
+				hashtags = ReelPoster.normalize_hashtags(user_hashtags)
+				description = f"{description} {hashtags}".strip()
+				self._log(f"Additional hashtags applied: {hashtags}")
+			else:
+				self._log("Additional hashtags disabled")
 		else:
 			self._log("Additional hashtags disabled")
 
