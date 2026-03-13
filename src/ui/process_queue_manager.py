@@ -63,28 +63,26 @@ class ProcessQueueManager(QObject):
 		if self.log_fn:
 			self.log_fn(msg)
 	
-	def validate_new_process(
-		self,
+	def validate_new_process(self,
 		instance_serial: str,
 		instance_name: str,
 		selected_instances: list[Any],
 		post_mode: str,
-		scheduled_at: datetime | None,
-	) -> tuple[bool, str]:
+		scheduled_at: datetime | None,) -> tuple[bool, str]:
 		"""Validate if a new process can be added.
 		
 		Same-instance processes are allowed and will be queued (not rejected).
 		Only truly invalid requests are rejected.
 		
 		Returns:
-			(is_valid, error_message)
+		(is_valid, error_message)
 		"""
-		# Reject multi-instance start (one process = one instance)
+			# Reject multi-instance start (one process = one instance)
 		if len(selected_instances) > 1:
 			return False, "You cannot start one process for multiple instances."
 		
-		# Same instance already running? That's fine — process will be queued.
-		# No rejection here.
+			# Same instance already running? That's fine — process will be queued.
+			# No rejection here.
 		
 		return True, ""
 	

@@ -513,15 +513,18 @@ class ReelsPosterPage(QWidget):
 		queue_toolbar.addWidget(self.clear_completed_btn)
 		queue_layout.addLayout(queue_toolbar)
 
-		self.queue_table = QTableWidget(0, 8)
+		self.COL_Q_ACTION = 8
+		self.queue_table = QTableWidget(0, 9)
 		self.queue_table.setHorizontalHeaderLabels([
 			"Instance", "Page", "Media", "Mode",
-			"Schedule", "Status", "Progress", "Result",
+			"Schedule", "Status", "Progress", "Result", "Action"
 		])
 		header = self.queue_table.horizontalHeader()
 		header.setStretchLastSection(True)
 		header.setSectionResizeMode(self.COL_Q_STATUS, QHeaderView.ResizeMode.ResizeToContents)
 		header.setSectionResizeMode(self.COL_Q_PROGRESS, QHeaderView.ResizeMode.Stretch)
+		header.setSectionResizeMode(self.COL_Q_ACTION, QHeaderView.ResizeMode.Fixed)
+		header.resizeSection(self.COL_Q_ACTION, 48)
 		self.queue_table.setAlternatingRowColors(True)
 		self.queue_table.verticalHeader().setDefaultSectionSize(24)
 		self.queue_table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -1277,7 +1280,7 @@ class ReelsPosterPage(QWidget):
 			self.queue_table.setItem(row, self.COL_Q_SCHEDULE, QTableWidgetItem(schedule_time))
 			status = "queued"
 			status_item = QTableWidgetItem(status)
-			color = STATUS_COLORS.get(status, "#333")
+			color = STATUS_COLORS.get(status, "#FFFFFF")
 			status_item.setForeground(QColor(color))
 			self.queue_table.setItem(row, self.COL_Q_STATUS, status_item)
 			bar = QProgressBar()
@@ -1287,8 +1290,46 @@ class ReelsPosterPage(QWidget):
 			self.queue_table.setCellWidget(row, self.COL_Q_PROGRESS, bar)
 			self._queue_progress_bars[process.process_id] = bar
 			self.queue_table.setItem(row, self.COL_Q_RESULT, QTableWidgetItem(""))
+
+			# Action column: trash button
+			trash_btn = QPushButton()
+			trash_btn.setObjectName("iconButton")
+			trash_icon_path = icon_path("delete.png")
+			if trash_icon_path:
+				trash_btn.setIcon(QIcon(trash_icon_path))
+			else:
+				trash_btn.setText("Delete")
+			trash_btn.setFixedSize(32, 32)
+			trash_btn.setToolTip("Delete queued process")
+			trash_btn.clicked.connect(lambda _, pid=process.process_id: self._delete_queued_process(pid))
+			self.queue_table.setCellWidget(row, self.COL_Q_ACTION, trash_btn)
+
 			self._update_empty_states()
 		QTimer.singleShot(0, add_row)
+
+	def _delete_queued_process(self, process_id: str) -> None:
+		"""Delete a queued process from the queue and table."""
+		status = self._process_status.get(process_id, "queued")
+		if status != "queued":
+			self.log_fn(f"Delete rejected: process {process_id} is not queued")
+			self._toast.show_error("Only queued processes can be deleted.")
+			return
+		removed = self.queue_manager.remove_process(process_id)
+		if removed:
+			# Remove row from table
+			for row in range(self.queue_table.rowCount()):
+				item = self.queue_table.item(row, self.COL_Q_INSTANCE)
+				if item and item.data(Qt.UserRole) == process_id:
+					self.queue_table.removeRow(row)
+					break
+			# Remove progress bar reference
+			self._queue_progress_bars.pop(process_id, None)
+			self._process_status.pop(process_id, None)
+			self.log_fn(f"Queued process deleted: {process_id}")
+			self._update_empty_states()
+		else:
+			self.log_fn(f"Delete rejected: process {process_id} could not be removed")
+			self._toast.show_error("Delete failed: process could not be removed.")
 
 	def _on_queue_status_changed(self, process_id: str, status: str) -> None:
 		"""Handle process status change with color coding."""

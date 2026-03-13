@@ -2,15 +2,15 @@
 
 from PySide6.QtCore import QObject, Signal
 
-This manager handles:
-- Queue storage and ordering
-- Instance locking (per-instance serialization)
-- Running process tracking
-- Process lifecycle (queued -> running -> completed/failed)
-- Schedule detection and triggering
+# This manager handles:
+# - Queue storage and ordering
+# - Instance locking (per-instance serialization)
+# - Running process tracking
+# - Process lifecycle (queued -> running -> completed/failed)
+# - Schedule detection and triggering
 
-UI is notified via callbacks, not signals.
-Process data is immutable snapshots - UI state is never referenced.
+# UI is notified via callbacks, not signals.
+# Process data is immutable snapshots - UI state is never referenced.
 """
 from __future__ import annotations
 
@@ -24,14 +24,13 @@ from PySide6.QtCore import QObject, Signal
 
 from src.core.reel_jobs import ReelJob
 
-
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class ProcessSnapshot:
 	"""Immutable snapshot of a process at enqueue time.
-	
+    
 	Created once when user clicks Start, never modified.
 	Workers use this snapshot - no dependency on live UI state.
 	"""
@@ -51,7 +50,7 @@ class ProcessSnapshot:
 
 class ProcessQueueManager(QObject):
 	"""Core queue manager with per-instance locking.
-	
+    
 	Guarantees:
 	- Only one process runs per instance at a time
 	- Processes on different instances run in parallel
@@ -60,6 +59,41 @@ class ProcessQueueManager(QObject):
 	"""
 
 	process_queued = Signal(object)
+	process_started = Signal(object)
+	process_completed = Signal(str, int, int)
+	process_failed = Signal(str, str)
+	status_changed = Signal(str, str)
+
+	def __init__(self, log_fn: Callable[[str], None] | None = None):
+		super().__init__()
+		"""Initialize queue manager.
+        
+		Args:
+			log_fn: Optional logging callback
+		"""
+		self.log_fn = log_fn or (lambda msg: None)
+		# Queue state
+		self.queue: list[ProcessSnapshot] = []  # Pending processes in order
+		self.running: dict[str, str] = {}  # instance_name -> process_id
+		self.registry: dict[str, ProcessSnapshot] = {}  # process_id -> snapshot
+
+	def remove_process(self, process_id: str) -> bool:
+		"""Remove a process from the queue if it is still queued.
+		Returns True if removed, False otherwise.
+		"""
+		for idx, process in enumerate(self.queue):
+			if process.process_id == process_id:
+				# Only allow removal if not started
+				if getattr(process, 'started_at', None) is None:
+					self.queue.pop(idx)
+					self.registry.pop(process_id, None)
+					self._log(f"Queued process deleted: {process_id}")
+					return True
+				else:
+					self._log(f"Delete rejected: process {process_id} is not queued")
+					return False
+		self._log(f"Delete rejected: process {process_id} not found in queue")
+		return False
 	process_started = Signal(object)
 	process_completed = Signal(str, int, int)
 	process_failed = Signal(str, str)
