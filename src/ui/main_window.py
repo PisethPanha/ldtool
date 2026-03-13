@@ -51,18 +51,21 @@ class MainWindow(QMainWindow):
         self.state = AppState.instance()
         self._adb_manager = None
 
+        # Logging control
+        self.enable_ui_log = False  # Set True to enable UI log panel updates
+
         # ensure log widget exists before any page may call log()
         self._create_log_panel()
         self.log_bus = LogBus(self)
         self.log_bus.message.connect(self._append_log)
-        
+
         # ADBKeyboard install bus for thread-safe dialog handling
         self.adbkeyboard_install_bus = AdbKeyboardInstallBus(self)
         self.adbkeyboard_install_bus.install_requested.connect(
             self._handle_adbkeyboard_install_request,
             Qt.QueuedConnection  # Ensure UI thread execution
         )
-        
+
         self._create_tabs()
         self._create_status_bar()
 
@@ -183,11 +186,16 @@ class MainWindow(QMainWindow):
         self.ldplayer_status.setText("LDPlayer: detected" if has_dnconsole else "LDPlayer: not configured")
 
     def _append_log(self, message: str) -> None:
-        """Append ``message`` to the enhanced log panel with colour coding."""
-        self.log_widget.append_message(message)
+        """Append message to UI log panel if enabled."""
+        if self.enable_ui_log:
+            self.log_widget.append_message(message)
 
     def log(self, message: str) -> None:
-        self.log_bus.message.emit(message)
+        # Always print to terminal
+        print(message, flush=True)
+        # Optionally send to UI log panel
+        if self.enable_ui_log:
+            self.log_bus.message.emit(message)
 
     # ------------------------------------------------------------------
     # ADBKeyboard Installation Handler (UI Thread)
